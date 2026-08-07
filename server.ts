@@ -151,12 +151,15 @@ async function robustFetchPixeldrainLink(url: string): Promise<string> {
         const hubResponse = await fetchWithRetry(url);
         let html = await hubResponse.text();
         let $ = cheerio.load(html);
-
+          console.log("generate download link:",{url})
         // Step 2: Check for "Generate Direct Download Link" button or similar
+        console.log('Searching for generate button...');
         const $generateBtn = $("#download, a:contains('Generate')");
+        console.log('Found buttons:', $generateBtn.length);
         if ($generateBtn.length > 0) {
-            const generateUrl = $generateBtn.attr("href");
-            if (generateUrl) {
+            const rawGenerateUrl = $generateBtn.attr("href");
+            if (rawGenerateUrl) {
+                const generateUrl = new URL(rawGenerateUrl, url).href;
                 console.log(`Following generate link: ${generateUrl}`);
                 const finalResponse = await fetchWithRetry(generateUrl);
                 html = await finalResponse.text();
