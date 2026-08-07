@@ -6,7 +6,8 @@ import initSqlJs from "sql.js";
 import * as cheerio from "cheerio";
 
 const app = express();
-const PORT = 3000;
+const DEFAULT_PORT = Number(process.env.PORT) || 3000;
+const linkCache = new Map<string, string>();
 
 app.use(express.json());
 
@@ -119,6 +120,7 @@ async function scrapeMovieDetail(detailUrl: string) {
 async function fetchWithRetry(url: string, options: any = {}, retries = 2): Promise<Response> {
     for (let i = 0; i <= retries; i++) {
         try {
+          console.log(`Fetching URL: ${url} (Attempt ${i + 1}/${retries + 1})`);
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 15000);
             
@@ -144,26 +146,30 @@ async function fetchWithRetry(url: string, options: any = {}, retries = 2): Prom
 
 // Robustly extract Pixeldrain link following the site flow
 async function robustFetchPixeldrainLink(url: string): Promise<string> {
-    if (linkCache.has(url)) return linkCache.get(url)!;
-
+    const cachedUrl = linkCache.get(url);
+    if (cachedUrl) return cachedUrl;
+    // // console.log("original url:",url)
     try {
+        // console.log("generate download link:", { url });
+
         // Step 1: Fetch HubCloud Page
         const hubResponse = await fetchWithRetry(url);
         let html = await hubResponse.text();
         let $ = cheerio.load(html);
-          console.log("generate download link:",{url})
         // Step 2: Check for "Generate Direct Download Link" button or similar
-        console.log('Searching for generate button...');
+        // console.log('Searching for generate button...');
         const $generateBtn = $("#download, a:contains('Generate')");
-        console.log('Found buttons:', $generateBtn.length);
+        console.log('Found buttons:', $generateBtn);
         if ($generateBtn.length > 0) {
             const rawGenerateUrl = $generateBtn.attr("href");
+            // console.log('Found generate URL:', rawGenerateUrl);
             if (rawGenerateUrl) {
                 const generateUrl = new URL(rawGenerateUrl, url).href;
-                console.log(`Following generate link: ${generateUrl}`);
+                // console.log(`Following generate link: ${generateUrl}`);
                 const finalResponse = await fetchWithRetry(generateUrl);
                 html = await finalResponse.text();
                 $ = cheerio.load(html);
+                // console.log('After generate, new HTML loaded.',html);
             }
         }
 
@@ -172,6 +178,7 @@ async function robustFetchPixeldrainLink(url: string): Promise<string> {
         
         // Try regex on HTML
         const match = html.match(pixeldrainRegex);
+        console.log('Pixeldrain regex match:', match);
         if (match) {
             const finalUrl = match[0].replace("/u/", "/api/file/");
             linkCache.set(url, finalUrl);
@@ -470,9 +477,25 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  const listenOnPort = (port: number) => {
+    const server = app.listen(port, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${port}`);
+    });
+
+    server.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE") {
+        console.warn(`Port ${port} is already in use, trying ${port + 1}...`);
+        server.close(() => {
+          listenOnPort(port + 1);
+        });
+      } else {
+        console.error("Server failed to start:", error);
+        process.exit(1);
+      }
+    });
+  };
+
+  listenOnPort(DEFAULT_PORT);
 }
 
 startServer();
