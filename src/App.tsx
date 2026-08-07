@@ -3,7 +3,8 @@ import { Movie } from "./types";
 import { Header } from "./components/Header";
 import { ScraperControls } from "./components/ScraperControls";
 import { MovieList } from "./components/MovieList";
-import { Film, Sparkles, Server } from "lucide-react";
+import { Dashboard } from "./components/Dashboard";
+import { Film, Sparkles, Server, LayoutDashboard, Database } from "lucide-react";
 
 export default function App() {
   const [movies, setMovies] = useState<Movie[]>([]);
@@ -11,6 +12,26 @@ export default function App() {
   const [isScraping, setIsScraping] = useState<boolean>(false);
   const [lastScrapedInfo, setLastScrapedInfo] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showDashboard, setShowDashboard] = useState<boolean>(false);
+  const [scrapingStatus, setScrapingStatus] = useState({ 
+    fullScrape: { message: "Idle", progress: 0 },
+    monitoring: { message: "Idle", progress: 0 }
+  });
+
+  const fetchStatus = async () => {
+    try {
+        const res = await fetch("/api/scraper/status");
+        const data = await res.json();
+        setScrapingStatus(data);
+    } catch(e) {
+        console.error(e);
+    }
+  }
+
+  useEffect(() => {
+    const interval = setInterval(fetchStatus, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   const fetchMovies = async () => {
     try {
@@ -109,14 +130,55 @@ export default function App() {
         )}
 
         {/* Scraper Controls */}
+        <div className="bg-slate-800 p-4 rounded-xl space-y-4">
+          <div className="flex-1">
+              <div className="flex justify-between text-sm text-slate-300 mb-1">
+                  <span>Full Scrape</span>
+                  <span>{scrapingStatus.fullScrape.progress}%</span>
+              </div>
+              <div className="w-full bg-slate-700 rounded-full h-2">
+                  <div className="bg-blue-500 h-2 rounded-full transition-all duration-500" style={{ width: `${scrapingStatus.fullScrape.progress}%` }}></div>
+              </div>
+              <div className="text-xs text-slate-400 font-mono mt-1 truncate">{scrapingStatus.fullScrape.message}</div>
+          </div>
+          <div className="flex-1">
+              <div className="flex justify-between text-sm text-slate-300 mb-1">
+                  <span>Monitoring</span>
+                  <span>{scrapingStatus.monitoring.progress}%</span>
+              </div>
+              <div className="w-full bg-slate-700 rounded-full h-2">
+                  <div className="bg-green-500 h-2 rounded-full transition-all duration-500" style={{ width: `${scrapingStatus.monitoring.progress}%` }}></div>
+              </div>
+              <div className="text-xs text-slate-400 font-mono mt-1 truncate">{scrapingStatus.monitoring.message}</div>
+          </div>
+        </div>
+
         <ScraperControls
           onScrape={handleScrape}
           isScraping={isScraping}
           lastScrapedInfo={lastScrapedInfo}
         />
 
+        <div className="flex justify-end">
+            <button 
+                onClick={() => setShowDashboard(!showDashboard)}
+                className="flex items-center text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg transition"
+            >
+                {showDashboard ? <Film className="w-4 h-4 mr-2" /> : <LayoutDashboard className="w-4 h-4 mr-2" />}
+                {showDashboard ? "Back to Scraper" : "Show Database & Proxies"}
+            </button>
+        </div>
+
         {/* Movie Library */}
-        <MovieList movies={movies} isLoading={isLoading} />
+        {showDashboard ? (
+            <Dashboard 
+              isScraping={isScraping}
+              setIsScraping={setIsScraping}
+              scrapingStatus={scrapingStatus}
+            />
+        ) : (
+            <MovieList movies={movies} isLoading={isLoading} />
+        )}
       </main>
 
       <footer className="bg-slate-900 border-t border-slate-800 py-6 mt-16 text-center text-xs text-slate-400">
