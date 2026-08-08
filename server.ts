@@ -36,26 +36,29 @@ app.get("/api/scraper/status", (req, res) => {
 
 async function processMovies(scraped: any[], isMonitoring: boolean = false) {
     for (const m of scraped) {
-        // Fetch movies with the same title to ensure exact match
-        const existing = dbAll("SELECT title FROM movies WHERE title = ?", [m.title]);
+        // Normalize the title: trim, remove extra spaces
+        const normalizedTitle = m.title.replace(/\s+/g, ' ').trim();
         
-        // Check for exact title match (JS side)
-        const exists = existing.length > 0 && existing.some((row: any) => row.title === m.title);
+        // Fetch all movie titles to check for duplicates
+        const existingMovies = dbAll("SELECT title FROM movies");
+        
+        // Check for exact title match (JS side) with normalization
+        const exists = existingMovies.some((row: any) => row.title.replace(/\s+/g, ' ').trim() === normalizedTitle);
         
         if (!exists) {
             if (isMonitoring) {
-                scrapingStatus.monitoring = { message: `Adding: ${m.title}`, progress: 50 };
+                scrapingStatus.monitoring = { message: `Adding: ${normalizedTitle}`, progress: 50 };
             } else {
-                scrapingStatus.fullScrape = { message: `Processing: ${m.title}`, progress: 50 };
+                scrapingStatus.fullScrape = { message: `Processing: ${normalizedTitle}`, progress: 50 };
             }
             try {
                 const links = await scrapeMovieDetail(m.detail_url);
                 dbRun(
                     `INSERT INTO movies (title, release_year, quality, poster_url, links, page_num, scraped_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
-                    [m.title, m.release_year, m.quality, m.poster_url, JSON.stringify(links), m.page_num]
+                    [normalizedTitle, m.release_year, m.quality, m.poster_url, JSON.stringify(links), m.page_num]
                 );
             } catch (e) {
-                console.error(`Failed to scrape details for ${m.title}:`, e);
+                console.error(`Failed to scrape details for ${normalizedTitle}:`, e);
             }
         }
     }
