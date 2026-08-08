@@ -20,6 +20,7 @@ let scrapingStatus = {
 };
 let currentFullScrapePage = 1;
 let isFullScrapeDone = false;
+const processingTitles = new Set<string>();
 
 app.post("/api/scraper/toggle", (req, res) => {
     isScraping = !isScraping;
@@ -27,6 +28,7 @@ app.post("/api/scraper/toggle", (req, res) => {
         fullScrape: { message: isScraping ? "Idle" : "Idle", progress: 0 },
         monitoring: { message: isScraping ? "Idle" : "Idle", progress: 0 }
     };
+    if (!isScraping) processingTitles.clear();
     res.json({ isScraping });
 });
 
@@ -36,9 +38,13 @@ app.get("/api/scraper/status", (req, res) => {
 
 async function processMovies(scraped: any[], isMonitoring: boolean = false) {
     for (const m of scraped) {
+        if (!isScraping) break;
+
         // Normalize the title: trim, remove extra spaces
         const normalizedTitle = m.title.replace(/\s+/g, ' ').trim();
         
+        if (processingTitles.has(normalizedTitle)) continue;
+
         // Fetch all movie titles to check for duplicates
         const existingMovies = dbAll("SELECT title FROM movies");
         
@@ -46,6 +52,7 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
         const exists = existingMovies.some((row: any) => row.title.replace(/\s+/g, ' ').trim() === normalizedTitle);
         
         if (!exists) {
+            processingTitles.add(normalizedTitle);
             if (isMonitoring) {
                 scrapingStatus.monitoring = { message: `Adding: ${normalizedTitle}`, progress: 50 };
             } else {
@@ -59,6 +66,8 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
                 );
             } catch (e) {
                 console.error(`Failed to scrape details for ${normalizedTitle}:`, e);
+            } finally {
+                processingTitles.delete(normalizedTitle);
             }
         }
     }
