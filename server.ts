@@ -2,14 +2,14 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
-import initSqlJs from "sql.js";
+import { connectToDatabase, getDb, getMoviesCollection, getProxiesCollection } from "./src/db.ts";
 import * as cheerio from "cheerio";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 app.use(express.json());
 const DEFAULT_PORT = Number(process.env.PORT) || 3000;
-let BASE_URL = "https://new3.movies4u.clinic/";
+let BASE_URL = "https://new4.movies4u.clinic/";
 const linkCache = new Map<string, string>();
 
 import seenLinksRouter from "./src/seenLinks.ts";
@@ -46,13 +46,9 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
 
     if (processingTitles.has(normalizedTitle)) continue;
 
-    // Fetch all movie titles to check for duplicates
-    const existingMovies = dbAll("SELECT title FROM movies");
-
-    // Check for exact title match (JS side) with normalization
-    const exists = existingMovies.some(
-      (row: any) => row.title.replace(/\s+/g, " ").trim() === normalizedTitle,
-    );
+    // Check if the movie already exists in MongoDB
+    const moviesCol = getMoviesCollection();
+    const exists = await moviesCol.findOne({ title: normalizedTitle });
 
     if (!exists) {
       processingTitles.add(normalizedTitle);
@@ -69,17 +65,20 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
       }
       try {
         const links = await scrapeMovieDetail(m.detail_url);
-        dbRun(
-          `INSERT INTO movies (title, release_year, quality, poster_url, links, page_num, scraped_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
-          [
-            normalizedTitle,
-            m.release_year,
-            m.quality,
-            m.poster_url,
-            JSON.stringify(links),
-            m.page_num,
-          ],
-        );
+        
+        const nextId = await getNextMovieId();
+
+        await moviesCol.insertOne({
+          id: nextId,
+          title: normalizedTitle,
+          release_year: m.release_year,
+          quality: m.quality,
+          poster_url: m.poster_url,
+          links: links,
+          page_num: m.page_num,
+          scraped_at: new Date().toISOString(),
+          priority: 0,
+        });
       } catch (e) {
         console.error(`Failed to scrape details for ${normalizedTitle}:`, e);
       } finally {
@@ -158,43 +157,45 @@ async function startContinuousScraping() {
   runMonitoringLoop();
 }
 
-// SQLite Database Setup using sql.js
-let db: any = null;
-const dbPath = path.join(process.cwd(), "database.sqlite");
+// Typed interface for counters collection to allow string _id
+interface CounterDoc {
+  _id: string;
+  seq: number;
+}
 
-async function initDatabase() {
+// Auto-increment atomic ID helper for parallel scraping
+async function getCounterCol() {
+  return getDb().collection<CounterDoc>("counters");
+}
+
+async function initCounter() {
   try {
-    const SQL = await initSqlJs();
-    if (fs.existsSync(dbPath)) {
-      const filebuffer = fs.readFileSync(dbPath);
-      db = new SQL.Database(filebuffer);
-    } else {
-      db = new SQL.Database();
+    const counterCol = await getCounterCol();
+    const exists = await counterCol.findOne({ _id: "movieId" } as any);
+    if (!exists) {
+      const moviesCol = getMoviesCollection();
+      const maxMovie = await moviesCol.findOne({}, { sort: { id: -1 } });
+      const maxId = maxMovie && typeof maxMovie.id === "number" ? maxMovie.id : 0;
+      await counterCol.updateOne(
+        { _id: "movieId" } as any,
+        { $set: { seq: maxId } },
+        { upsert: true }
+      );
+      console.log(`Initialized movieId counter to ${maxId}`);
     }
-
-    db.run(`
-      CREATE TABLE IF NOT EXISTS movies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        release_year TEXT,
-        quality TEXT,
-        poster_url TEXT,
-        links TEXT,
-        page_num INTEGER,
-        scraped_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS proxies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL UNIQUE,
-        latency INTEGER,
-        last_checked TEXT
-      );
-    `);
-    saveDatabase();
-    console.log("SQLite database initialized successfully.");
   } catch (err) {
-    console.error("Failed to initialize SQLite database:", err);
+    console.error("Failed to initialize movie counter:", err);
   }
+}
+
+async function getNextMovieId(): Promise<number> {
+  const counterCol = await getCounterCol();
+  const result = await counterCol.findOneAndUpdate(
+    { _id: "movieId" } as any,
+    { $inc: { seq: 1 } },
+    { returnDocument: "after", upsert: true }
+  );
+  return result && typeof result.seq === "number" ? result.seq : Date.now();
 }
 
 async function scrapeMovieDetail(detailUrl: string) {
@@ -297,9 +298,12 @@ async function fetchWithRetry(
       };
 
       if (useProxy) {
-        const proxy = dbAll(
-          "SELECT url FROM proxies WHERE latency IS NOT NULL ORDER BY RANDOM() LIMIT 1",
-        )[0];
+        const proxiesCol = getProxiesCollection();
+        const randomProxyArr = await proxiesCol.aggregate([
+          { $match: { latency: { $ne: null } } },
+          { $sample: { size: 1 } }
+        ]).toArray();
+        const proxy = randomProxyArr[0];
         if (proxy) {
           console.log(`Using proxy: ${proxy.url}`);
           // @ts-ignore
@@ -364,33 +368,6 @@ async function robustFetchPixeldrainLink(url: string): Promise<string> {
   }
 }
 
-function saveDatabase() {
-  if (db) {
-    const data = db.export();
-    fs.writeFileSync(dbPath, Buffer.from(data));
-  }
-}
-
-// Helper to run query and return all objects
-function dbAll(query: string, params: any[] = []) {
-  if (!db) return [];
-  const stmt = db.prepare(query);
-  stmt.bind(params);
-  const rows = [];
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return rows;
-}
-
-// Helper to run execute
-function dbRun(query: string, params: any[] = []) {
-  if (!db) return;
-  db.run(query, params);
-  saveDatabase();
-}
-
 async function fetchAndRefreshProxies() {
   console.log("Refreshing proxies...");
   try {
@@ -400,13 +377,18 @@ async function fetchAndRefreshProxies() {
     const text = await res.text();
     const proxies = text.split("\r\n").filter((p) => p.length > 5);
 
-    for (const proxyUrl of proxies) {
-      db.run(
-        "INSERT OR IGNORE INTO proxies (url, last_checked) VALUES (?, ?)",
-        [proxyUrl, new Date().toISOString()],
-      );
+    if (proxies.length > 0) {
+      const proxiesCol = getProxiesCollection();
+      await proxiesCol.deleteMany({});
+      
+      const docs = proxies.map(url => ({
+        url: url.trim(),
+        latency: null,
+        last_checked: new Date().toISOString()
+      }));
+      await proxiesCol.insertMany(docs, { ordered: false });
+      console.log(`Successfully refreshed proxies. Overwrote DB with ${proxies.length} new proxies.`);
     }
-    saveDatabase();
   } catch (e) {
     console.error("Error fetching proxies:", e);
   }
@@ -428,19 +410,18 @@ async function testProxyLatency(proxyUrl: string) {
 
     if (res.ok) {
       const latency = Date.now() - start;
-      dbRun("UPDATE proxies SET latency = ?, last_checked = ? WHERE url = ?", [
-        latency,
-        new Date().toISOString(),
-        proxyUrl,
-      ]);
+      await getProxiesCollection().updateOne(
+        { url: proxyUrl },
+        { $set: { latency, last_checked: new Date().toISOString() } }
+      );
       return latency;
     }
   } catch (e) {
     console.error(`Proxy test failed for ${proxyUrl}:`, e);
-    dbRun("UPDATE proxies SET latency = NULL, last_checked = ? WHERE url = ?", [
-      new Date().toISOString(),
-      proxyUrl,
-    ]);
+    await getProxiesCollection().updateOne(
+      { url: proxyUrl },
+      { $set: { latency: null, last_checked: new Date().toISOString() } }
+    );
   }
   return null;
 }
@@ -606,75 +587,126 @@ async function scrapePage(pageNum: number) {
 app.use("/api/seen-links", seenLinksRouter);
 
 // Get all movies or filter by search / page range
-app.get("/api/movies", (req, res) => {
+app.get("/api/movies", async (req, res) => {
   console.log("GET /api/movies called with query:", req.query);
   try {
-    const { search, quality, pageMin, pageMax, pageNum } = req.query;
+    const { search, quality, pageMin, pageMax, pageNum, page, limit } = req.query;
 
-    let query = "SELECT * FROM movies WHERE 1=1";
-    const params: any[] = [];
+    const pageFilter = parseInt(page as string) || 1;
+    const limitFilter = parseInt(limit as string) || 30;
+    const skip = (pageFilter - 1) * limitFilter;
+
+    const filter: any = {};
 
     if (search && typeof search === "string") {
-      query += " AND (title LIKE ? OR release_year LIKE ? OR quality LIKE ?)";
-      const term = `%${search}%`;
-      params.push(term, term, term);
+      const regex = new RegExp(search, "i");
+      filter.$or = [
+        { title: regex },
+        { release_year: regex },
+        { quality: regex }
+      ];
     }
 
     if (quality && typeof quality === "string" && quality !== "ALL") {
-      query += " AND quality = ?";
-      params.push(quality);
+      filter.quality = quality;
     }
 
     if (pageMin && !isNaN(Number(pageMin))) {
-      query += " AND page_num >= ?";
-      params.push(Number(pageMin));
+      filter.page_num = filter.page_num || {};
+      filter.page_num.$gte = Number(pageMin);
     }
 
     if (pageMax && !isNaN(Number(pageMax))) {
-      query += " AND page_num <= ?";
-      params.push(Number(pageMax));
+      filter.page_num = filter.page_num || {};
+      filter.page_num.$lte = Number(pageMax);
     }
 
     const pageNumFilter = pageNum ? parseInt(pageNum as string) : null;
     if (pageNumFilter && !isNaN(pageNumFilter)) {
-      query += " AND page_num = ?";
-      params.push(pageNumFilter);
+      filter.page_num = pageNumFilter;
     }
 
-    query += " ORDER BY id DESC";
+    const moviesCol = getMoviesCollection();
+    const matchingCount = await moviesCol.countDocuments(filter);
 
-    const movies = dbAll(query, params);
+    const movies = await moviesCol
+      .find(filter)
+      .sort({ priority: -1, id: -1 }) // Prioritized first, and latest scraped first
+      .skip(skip)
+      .limit(limitFilter)
+      .toArray();
+
+    const mappedMovies = movies.map((m: any) => ({
+      ...m,
+      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links)
+    }));
+
+    const totalCount = await moviesCol.countDocuments({});
+    const pagesList = await moviesCol.distinct("page_num");
+    const sortedPages = pagesList.sort((a, b) => Number(a) - Number(b));
+    const qualitiesList = await moviesCol.distinct("quality");
+    const sortedQualities = qualitiesList.sort();
+
     res.json({
       success: true,
-      count: movies.length,
-      movies,
-      total: movies.length,
+      count: mappedMovies.length,
+      movies: mappedMovies,
+      total: totalCount,
+      matchingCount: matchingCount,
+      pages: sortedPages,
+      qualities: sortedQualities,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Get raw database content
-app.get("/api/db-dump", (req, res) => {
+// Update priority for a specific movie
+app.patch("/api/movies/:id/priority", async (req, res) => {
   try {
-    const movies = dbAll("SELECT * FROM movies");
-    res.json({ success: true, movies });
+    const { id } = req.params;
+    const { priority } = req.body;
+    const pValue = Number(priority) || 0;
+
+    await getMoviesCollection().updateOne(
+      { id: Number(id) },
+      { $set: { priority: pValue } }
+    );
+    res.json({ success: true, message: `Movie #${id} priority updated to ${pValue}` });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get("/api/proxies", (req, res) => {
+// Get raw database content
+app.get("/api/db-dump", async (req, res) => {
+  try {
+    const movies = await getMoviesCollection().find({}).toArray();
+    const mappedMovies = movies.map((m: any) => ({
+      ...m,
+      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links)
+    }));
+    res.json({ success: true, movies: mappedMovies });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/api/proxies", async (req, res) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = 20;
     const offset = (page - 1) * limit;
-    const proxies = dbAll(
-      "SELECT * FROM proxies ORDER BY latency ASC LIMIT ? OFFSET ?",
-      [limit, offset],
-    );
-    const total = dbAll("SELECT COUNT(*) as count FROM proxies")[0].count;
+    
+    const proxiesCol = getProxiesCollection();
+    const proxies = await proxiesCol
+      .find({})
+      .sort({ latency: 1 })
+      .skip(offset)
+      .limit(limit)
+      .toArray();
+
+    const total = await proxiesCol.countDocuments();
     res.json({ success: true, proxies, total, page, limit });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -705,33 +737,36 @@ app.post("/api/scrape", async (req, res) => {
 
     let totalScraped = 0;
     const errors: string[] = [];
-    const allMovieData: any[] = [];
 
     // Parallel processing pages
     const pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
+
+    const moviesCol = getMoviesCollection();
 
     await Promise.all(
       pages.map(async (p) => {
         try {
           const scraped = await scrapePage(p);
           for (const m of scraped) {
-            const existing = dbAll(
-              "SELECT id FROM movies WHERE title = ? AND page_num = ?",
-              [m.title, m.page_num],
-            );
-            if (existing.length === 0) {
+            const normalizedTitle = m.title.replace(/\s+/g, " ").trim();
+            const existing = await moviesCol.findOne({
+              title: normalizedTitle
+            });
+            if (!existing) {
               const links = await scrapeMovieDetail(m.detail_url);
-              dbRun(
-                `INSERT INTO movies (title, release_year, quality, poster_url, links, page_num, scraped_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
-                [
-                  m.title,
-                  m.release_year,
-                  m.quality,
-                  m.poster_url,
-                  JSON.stringify(links),
-                  m.page_num,
-                ],
-              );
+              const nextId = await getNextMovieId();
+
+              await moviesCol.insertOne({
+                id: nextId,
+                title: normalizedTitle,
+                release_year: m.release_year,
+                quality: m.quality,
+                poster_url: m.poster_url,
+                links: links,
+                page_num: m.page_num,
+                scraped_at: new Date().toISOString(),
+                priority: 0,
+              });
               totalScraped++;
             }
           }
@@ -742,13 +777,18 @@ app.post("/api/scrape", async (req, res) => {
       }),
     );
 
-    const allMovies = dbAll("SELECT * FROM movies ORDER BY id DESC");
+    const allMovies = await moviesCol.find({}).sort({ id: 1 }).toArray();
+    const mappedMovies = allMovies.map((m: any) => ({
+      ...m,
+      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links)
+    }));
+
     res.json({
       success: true,
       newScraped: totalScraped,
-      totalCount: allMovies.length,
+      totalCount: mappedMovies.length,
       errors: errors.length > 0 ? errors : undefined,
-      movies: allMovies,
+      movies: mappedMovies,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -756,11 +796,10 @@ app.post("/api/scrape", async (req, res) => {
 });
 
 // Delete all movies
-app.delete("/api/movies", (req, res) => {
+app.delete("/api/movies", async (req, res) => {
   try {
     console.log("Received DELETE request to /api/movies");
-    dbRun("DELETE FROM movies");
-    dbRun("DELETE FROM sqlite_sequence WHERE name='movies'");
+    await getMoviesCollection().deleteMany({});
     res.json({ success: true, message: "All movies cleared from database." });
   } catch (err: any) {
     console.error("Error clearing database:", err);
@@ -769,7 +808,8 @@ app.delete("/api/movies", (req, res) => {
 });
 
 async function startServer() {
-  await initDatabase();
+  await connectToDatabase();
+  await initCounter();
   startContinuousScraping();
 
   // Vite middleware for development

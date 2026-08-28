@@ -7,4 +7,6 @@ export interface Movie {
   links: string; // JSON string: { quality: string; links: { text: string; url: string }[] }[]
   page_num: number;
   scraped_at: string;
+  priority?: number;
 }
+

@@ -1,12 +1,13 @@
 import React from "react";
 import { Movie } from "../types";
-import { Calendar, ExternalLink, Layers } from "lucide-react";
+import { Calendar, ExternalLink, Layers, Star } from "lucide-react";
 
 interface MovieCardProps {
   movie: Movie;
+  onTogglePriority?: (id: number, currentPriority: number) => void;
 }
 
-export const MovieCard: React.FC<MovieCardProps> = ({ movie }) => {
+export const MovieCard: React.FC<MovieCardProps> = ({ movie, onTogglePriority }) => {
   let parsedLinks: { quality: string; links: { text: string; url: string }[] }[] = [];
   try {
     parsedLinks = JSON.parse(movie.links);
@@ -14,8 +15,22 @@ export const MovieCard: React.FC<MovieCardProps> = ({ movie }) => {
     console.error("Failed to parse links", e);
   }
 
+  const isPriority = (movie.priority ?? 0) > 0;
+
   return (
-    <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-300 flex flex-col group">
+    <div
+      className={`bg-white border rounded-2xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-300 flex flex-col group relative ${
+        isPriority ? "ring-2 ring-amber-400 border-amber-300" : "border-slate-200"
+      }`}
+    >
+      {/* Priority Ribbon / Badge if prioritized */}
+      {isPriority && (
+        <div className="absolute top-0 right-0 z-20 bg-gradient-to-l from-amber-500 to-amber-600 text-white text-[10px] font-extrabold px-2.5 py-0.5 rounded-bl-lg shadow-md flex items-center gap-1">
+          <Star className="w-3 h-3 fill-white" />
+          <span>PRIORITY</span>
+        </div>
+      )}
+
       {/* Poster Container */}
       <div className="relative aspect-[2/3] bg-slate-900 overflow-hidden">
         <img
@@ -34,8 +49,8 @@ export const MovieCard: React.FC<MovieCardProps> = ({ movie }) => {
           {movie.quality}
         </div>
 
-        {/* Page Badge */}
-        <div className="absolute top-3 right-3 bg-slate-900/80 backdrop-blur-md text-slate-200 font-medium text-xs px-2.5 py-1 rounded-lg border border-slate-700/50 flex items-center gap-1">
+        {/* Page Badge (adjust right position if priority badge is active) */}
+        <div className={`absolute ${isPriority ? 'top-8' : 'top-3'} right-3 bg-slate-900/80 backdrop-blur-md text-slate-200 font-medium text-xs px-2.5 py-1 rounded-lg border border-slate-700/50 flex items-center gap-1 transition-all`}>
           <Layers className="w-3 h-3 text-red-400" />
           <span>Pg {movie.page_num}</span>
         </div>
@@ -54,7 +69,31 @@ export const MovieCard: React.FC<MovieCardProps> = ({ movie }) => {
 
       {/* Footer / Actions */}
       <div className="p-4 bg-white flex flex-col gap-3 mt-auto border-t border-slate-100">
-        <span className="text-[10px] text-slate-400 font-mono truncate">ID: #{movie.id}</span>
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] text-slate-400 font-mono truncate">ID: #{movie.id}</span>
+          
+          {/* Priority Checkbox / Star Toggle Button */}
+          {onTogglePriority && (
+            <button
+              onClick={() => onTogglePriority(movie.id, movie.priority ?? 0)}
+              title={isPriority ? "Remove from Priority" : "Set as Priority (Links come first)"}
+              className={`flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded-lg border transition-all ${
+                isPriority
+                  ? "bg-amber-50 border-amber-300 text-amber-700 hover:bg-amber-100"
+                  : "bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={isPriority}
+                onChange={() => {}} // handled by button onClick
+                className="w-3.5 h-3.5 text-amber-600 rounded border-slate-300 focus:ring-amber-500 cursor-pointer pointer-events-none"
+              />
+              <span className="cursor-pointer">Priority</span>
+            </button>
+          )}
+        </div>
+
         <div className="space-y-2">
           {parsedLinks.length > 0 ? (
             parsedLinks.map((qGroup, idx) => (

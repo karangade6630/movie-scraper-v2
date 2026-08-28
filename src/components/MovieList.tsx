@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useMemo } from "react";
 import { Movie } from "../types";
 import { MovieCard } from "./MovieCard";
 import { Search, Filter, Film, ArrowUpDown, Layers } from "lucide-react";
@@ -6,44 +6,54 @@ import { Search, Filter, Film, ArrowUpDown, Layers } from "lucide-react";
 interface MovieListProps {
   movies: Movie[];
   isLoading: boolean;
+  onTogglePriority?: (id: number, currentPriority: number) => void;
+  searchTerm: string;
+  setSearchTerm: (val: string) => void;
+  selectedQuality: string;
+  setSelectedQuality: (val: string) => void;
+  selectedPage: string | number;
+  setSelectedPage: (val: string | number) => void;
+  sortBy: "newest" | "title" | "year";
+  setSortBy: (val: "newest" | "title" | "year") => void;
+  availablePages: (string | number)[];
+  availableQualities: string[];
+  totalMovies: number;
+  onLoadMore?: () => void;
+  hasMore?: boolean;
 }
 
-export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
-  const [searchTerm, setSearchTerm] = useState("");
-  const [selectedQuality, setSelectedQuality] = useState("ALL");
-  const [selectedPage, setSelectedPage] = useState("ALL");
-  const [sortBy, setSortBy] = useState<"newest" | "title" | "year">("newest");
-
-  // Extract unique qualities and pages for filters
-  const qualities = useMemo(() => {
-    const qSet = new Set(movies.map((m) => m.quality));
-    return ["ALL", ...Array.from(qSet)];
-  }, [movies]);
-
-  const pages = useMemo(() => {
-    const pSet = new Set(movies.map((m) => m.page_num));
-    const sortedPages = Array.from(pSet).sort((a, b) => Number(a) - Number(b));
-    return ["ALL", ...sortedPages];
-  }, [movies]);
-
-  // Filter and sort movies
+export const MovieList: React.FC<MovieListProps> = ({
+  movies,
+  isLoading,
+  onTogglePriority,
+  searchTerm,
+  setSearchTerm,
+  selectedQuality,
+  setSelectedQuality,
+  selectedPage,
+  setSelectedPage,
+  sortBy,
+  setSortBy,
+  availablePages,
+  availableQualities,
+  totalMovies,
+  onLoadMore,
+  hasMore
+}) => {
+  // Sort movies (filtering is handled server-side now)
   const filteredMovies = useMemo(() => {
-    return movies
-      .filter((movie) => {
-        const matchesSearch =
-          movie.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-          movie.release_year.includes(searchTerm);
-        const matchesQuality = selectedQuality === "ALL" || movie.quality === selectedQuality;
-        const matchesPage = selectedPage === "ALL" || movie.page_num === Number(selectedPage);
-        return matchesSearch && matchesQuality && matchesPage;
-      })
-      .sort((a, b) => {
-        if (sortBy === "newest") return b.id - a.id;
-        if (sortBy === "title") return a.title.localeCompare(b.title);
-        if (sortBy === "year") return b.release_year.localeCompare(a.release_year);
-        return 0;
-      });
-  }, [movies, searchTerm, selectedQuality, selectedPage, sortBy]);
+    return [...movies].sort((a, b) => {
+      // Priority movies always come first
+      const pDiff = (b.priority ?? 0) - (a.priority ?? 0);
+      if (pDiff !== 0) return pDiff;
+
+      if (sortBy === "newest") return b.id - a.id;
+      if (sortBy === "title") return a.title.localeCompare(b.title);
+      if (sortBy === "year")
+        return b.release_year.localeCompare(a.release_year);
+      return 0;
+    });
+  }, [movies, sortBy]);
 
   return (
     <div className="space-y-6">
@@ -66,15 +76,17 @@ export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
           {/* Quality Filter */}
           <div className="flex items-center space-x-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
             <Filter className="w-3.5 h-3.5 text-slate-500" />
-            <span className="text-xs font-semibold text-slate-600">Quality:</span>
+            <span className="text-xs font-semibold text-slate-600">
+              Quality:
+            </span>
             <select
               value={selectedQuality}
               onChange={(e) => setSelectedQuality(e.target.value)}
               className="bg-transparent text-xs font-bold text-slate-800 focus:outline-none cursor-pointer"
             >
-              {qualities.map((q) => (
+              {availableQualities.map((q) => (
                 <option key={q} value={q}>
-                  {q}
+                  {q === "ALL" ? "All Qualities" : q}
                 </option>
               ))}
             </select>
@@ -89,7 +101,7 @@ export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
               onChange={(e) => setSelectedPage(e.target.value)}
               className="bg-transparent text-xs font-bold text-slate-800 focus:outline-none cursor-pointer"
             >
-              {pages.map((p) => (
+              {availablePages.map((p) => (
                 <option key={p} value={p}>
                   {p === "ALL" ? "All Pages" : `Page ${p}`}
                 </option>
@@ -117,7 +129,9 @@ export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
       {/* Results Count */}
       <div className="flex items-center justify-between text-sm text-slate-600 px-1">
         <span>
-          Showing <strong className="text-slate-900">{filteredMovies.length}</strong> of {movies.length} movies in SQLite
+          Showing{" "}
+          <strong className="text-slate-900">{filteredMovies.length}</strong> of{" "}
+          {totalMovies} movies in Database
         </span>
       </div>
 
@@ -133,7 +147,9 @@ export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
           <div className="w-16 h-16 bg-red-50 text-red-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
             <Film className="w-8 h-8" />
           </div>
-          <h3 className="text-lg font-bold text-slate-900 mb-1">No movies found</h3>
+          <h3 className="text-lg font-bold text-slate-900 mb-1">
+            No movies found
+          </h3>
           <p className="text-sm text-slate-500 max-w-sm mx-auto mb-6">
             {movies.length === 0
               ? "No movies scraped yet. Use the scraper controls above to fetch movies from movies4u.clinic!"
@@ -141,10 +157,28 @@ export const MovieList: React.FC<MovieListProps> = ({ movies, isLoading }) => {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-6">
-          {filteredMovies.map((movie) => (
-            <MovieCard key={movie.id} movie={movie} />
-          ))}
+        <div className="space-y-8">
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-6">
+            {filteredMovies.map((movie) => (
+              <MovieCard
+                key={movie.id}
+                movie={movie}
+                onTogglePriority={onTogglePriority}
+              />
+            ))}
+          </div>
+
+          {hasMore && onLoadMore && (
+            <div className="flex justify-center pt-4 animate-fade-in">
+              <button
+                onClick={onLoadMore}
+                disabled={isLoading}
+                className="bg-slate-900 hover:bg-red-600 text-white text-sm font-semibold px-6 py-3 rounded-xl transition duration-300 shadow-md disabled:bg-slate-800/50 disabled:text-slate-500 cursor-pointer"
+              >
+                {isLoading ? "Loading..." : "Load More Movies"}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
