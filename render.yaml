@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: movie-scraper-v2
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node dist/server.cjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_OPTIONS
+        value: "--openssl-legacy-provider"
+      - key: MONGODB_URI
+        sync: false   # Set this manually in Render dashboard

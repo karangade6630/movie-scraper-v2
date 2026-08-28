@@ -13,7 +13,12 @@ let db: Db | null = null;
 
 export async function connectToDatabase(): Promise<Db> {
   if (db) return db;
-  client = new MongoClient(uri!);
+  client = new MongoClient(uri!, {
+    tls: true,
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 30000,
+  });
   await client.connect();
   db = client.db("movie_scraper");
   console.log("Connected to MongoDB successfully");
