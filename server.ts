@@ -672,6 +672,47 @@ app.get("/api/movies", async (req, res) => {
   }
 });
 
+app.get("/api/movies-to-download", async (req, res) => {
+  console.log("GET /api/movies called with query:", req.query);
+  try {
+    const filter: any = {};
+
+
+    const moviesCol = getMoviesCollection();
+    const matchingCount = await moviesCol.countDocuments(filter);
+
+    const movies = await moviesCol
+      .find(filter)
+      .sort({ priority: -1, id: -1 }) // Prioritized first, and latest scraped first
+      // .skip(skip)
+      // .limit(limitFilter)
+      .toArray();
+
+    const mappedMovies = movies.map((m: any) => ({
+      ...m,
+      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links),
+    }));
+
+    const totalCount = await moviesCol.countDocuments({});
+    const pagesList = await moviesCol.distinct("page_num");
+    const sortedPages = pagesList.sort((a, b) => Number(a) - Number(b));
+    const qualitiesList = await moviesCol.distinct("quality");
+    const sortedQualities = qualitiesList.sort();
+
+    res.json({
+      success: true,
+      count: mappedMovies.length,
+      movies: mappedMovies,
+      total: totalCount,
+      matchingCount: matchingCount,
+      pages: sortedPages,
+      qualities: sortedQualities,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Update priority for a specific movie
 app.patch("/api/movies/:id/priority", async (req, res) => {
   try {
