@@ -14,7 +14,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 const app = express();
 app.use(express.json());
 const DEFAULT_PORT = Number(process.env.PORT) || 3000;
-let BASE_URL = "https://new4.movies4u.clinic/";
+let BASE_URL = process.env.SITE_URL;
 const linkCache = new Map<string, string>();
 
 import seenLinksRouter from "./src/seenLinks.ts";
@@ -676,7 +676,6 @@ app.get("/api/movies-to-download", async (req, res) => {
   console.log("GET /api/movies called with query:", req.query);
   try {
     const filter: any = {};
-
 
     const moviesCol = getMoviesCollection();
     const matchingCount = await moviesCol.countDocuments(filter);
