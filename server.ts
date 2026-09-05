@@ -7,6 +7,8 @@ import {
   getDb,
   getMoviesCollection,
   getProxiesCollection,
+  getCountersCollection,
+  getSeenLinksCollection,
 } from "./src/db.ts";
 import * as cheerio from "cheerio";
 import { HttpsProxyAgent } from "https-proxy-agent";
@@ -14,7 +16,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 const app = express();
 app.use(express.json());
 const DEFAULT_PORT = Number(process.env.PORT) || 3000;
-let BASE_URL = process.env.SITE_URL;
+let BASE_URL = process.env.SITE_URL || 'https://new5.movies4u.clinic/';
 const linkCache = new Map<string, string>();
 
 import seenLinksRouter from "./src/seenLinks.ts";
@@ -34,6 +36,10 @@ app.post("/api/scraper/toggle", (req, res) => {
     fullScrape: { message: isScraping ? "Idle" : "Idle", progress: 0 },
     monitoring: { message: isScraping ? "Idle" : "Idle", progress: 0 },
   };
+  if (isScraping) {
+    currentFullScrapePage = 1;
+    isFullScrapeDone = false;
+  }
   if (!isScraping) processingTitles.clear();
   res.json({ isScraping });
 });
@@ -42,32 +48,51 @@ app.get("/api/scraper/status", (req, res) => {
   res.json(scrapingStatus);
 });
 
+function cleanMovieTitle(rawTitle: string): string {
+  let t = rawTitle || "";
+  t = t.replace(/\b(480p|720p|1080p|2160p|4k|hdr|hdrip|web-dl|bluray|cam|hd|hindi|english|dual audio|multi audio|org\.?|dubbed|full movie|batch|zip|uplay)\b/gi, "");
+  t = t.replace(/[\(\[\{\}\|]/g, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  t = t.replace(/[\-\s]+$/, "").trim();
+  return t.toLowerCase() || rawTitle.toLowerCase().trim();
+}
+
 async function processMovies(scraped: any[], isMonitoring: boolean = false) {
   for (const m of scraped) {
     if (!isScraping) break;
 
     // Normalize the title: trim, remove extra spaces
     const normalizedTitle = m.title.replace(/\s+/g, " ").trim();
+    const cleanedTitle = cleanMovieTitle(normalizedTitle);
+    const pageNum = m.page_num || currentFullScrapePage;
 
-    if (processingTitles.has(normalizedTitle)) continue;
+    if (!isMonitoring) {
+      scrapingStatus.fullScrape = {
+        message: `Processing Page ${pageNum}: ${normalizedTitle}`,
+        progress: Math.min(95, pageNum * 5),
+      };
+    } else {
+      scrapingStatus.monitoring = {
+        message: `Adding: ${normalizedTitle}`,
+        progress: 50,
+      };
+    }
 
-    // Check if the movie already exists in MongoDB
+    if (processingTitles.has(normalizedTitle) || processingTitles.has(cleanedTitle)) continue;
+
+    // Check if the movie already exists in MongoDB by detail_url, title, or cleaned_title
     const moviesCol = getMoviesCollection();
-    const exists = await moviesCol.findOne({ title: normalizedTitle });
+    const exists = await moviesCol.findOne({
+      $or: [
+        { detail_url: m.detail_url },
+        { title: normalizedTitle },
+        { cleaned_title: cleanedTitle }
+      ]
+    });
 
     if (!exists) {
       processingTitles.add(normalizedTitle);
-      if (isMonitoring) {
-        scrapingStatus.monitoring = {
-          message: `Adding: ${normalizedTitle}`,
-          progress: 50,
-        };
-      } else {
-        scrapingStatus.fullScrape = {
-          message: `Processing: ${normalizedTitle}`,
-          progress: 50,
-        };
-      }
+      processingTitles.add(cleanedTitle);
       try {
         const links = await scrapeMovieDetail(m.detail_url);
 
@@ -76,11 +101,12 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
         await moviesCol.insertOne({
           id: nextId,
           title: normalizedTitle,
+          cleaned_title: cleanedTitle,
           release_year: m.release_year,
           quality: m.quality,
           poster_url: m.poster_url,
           links: links,
-          page_num: m.page_num,
+          page_num: pageNum,
           scraped_at: new Date().toISOString(),
           priority: 0,
         });
@@ -88,6 +114,41 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
         console.error(`Failed to scrape details for ${normalizedTitle}:`, e);
       } finally {
         processingTitles.delete(normalizedTitle);
+        processingTitles.delete(cleanedTitle);
+      }
+    } else {
+      // If movie already exists, check if new links/episodes have been added
+      processingTitles.add(normalizedTitle);
+      processingTitles.add(cleanedTitle);
+      try {
+        const links = await scrapeMovieDetail(m.detail_url);
+        const existingLinksStr = JSON.stringify(exists.links || []);
+        const newLinksStr = JSON.stringify(links);
+
+        if (newLinksStr !== existingLinksStr) {
+          if (!isMonitoring) {
+            scrapingStatus.fullScrape = {
+              message: `Updating New Episodes/Links for Page ${pageNum}: ${normalizedTitle}`,
+              progress: Math.min(95, pageNum * 5),
+            };
+          }
+          await moviesCol.updateOne(
+            { _id: exists._id },
+            { 
+              $set: { 
+                links: links, 
+                quality: m.quality || exists.quality,
+                poster_url: m.poster_url || exists.poster_url,
+                scraped_at: new Date().toISOString() 
+              } 
+            }
+          );
+        }
+      } catch (e) {
+        console.error(`Failed to update links for ${normalizedTitle}:`, e);
+      } finally {
+        processingTitles.delete(normalizedTitle);
+        processingTitles.delete(cleanedTitle);
       }
     }
   }
@@ -107,7 +168,7 @@ async function runFullScrapeLoop() {
           continue;
         }
         scrapingStatus.fullScrape = {
-          message: `Full Scrape: Page ${currentFullScrapePage}...`,
+          message: `Full Scrape: Scraping Page ${currentFullScrapePage}...`,
           progress: Math.min(90, currentFullScrapePage * 10),
         };
         const scraped = await scrapePage(currentFullScrapePage);
@@ -118,6 +179,10 @@ async function runFullScrapeLoop() {
             progress: 100,
           };
         } else {
+          scrapingStatus.fullScrape = {
+            message: `Full Scrape: Processing Page ${currentFullScrapePage} (${scraped.length} items)`,
+            progress: Math.min(90, currentFullScrapePage * 10),
+          };
           await processMovies(scraped, false);
           currentFullScrapePage++;
         }
@@ -170,7 +235,7 @@ interface CounterDoc {
 
 // Auto-increment atomic ID helper for parallel scraping
 async function getCounterCol() {
-  return getDb().collection<CounterDoc>("counters");
+  return getCountersCollection();
 }
 
 async function initCounter() {
@@ -205,8 +270,20 @@ async function getNextMovieId(): Promise<number> {
 }
 
 async function scrapeMovieDetail(detailUrl: string) {
-  const links: { quality: string; links: { text: string; url: string }[] }[] =
-    [];
+  const links: { quality: string; links: { text: string; url: string }[] }[] = [];
+  
+  function addLink(quality: string, text: string, url: string) {
+    if (!url) return;
+    let qualityEntry = links.find((l) => l.quality === quality);
+    if (!qualityEntry) {
+      qualityEntry = { quality: quality, links: [] };
+      links.push(qualityEntry);
+    }
+    if (!qualityEntry.links.some((l) => l.url === url)) {
+      qualityEntry.links.push({ text, url });
+    }
+  }
+
   try {
     const response = await fetch(detailUrl, {
       headers: {
@@ -215,65 +292,79 @@ async function scrapeMovieDetail(detailUrl: string) {
       },
     });
     const html = await response.text();
-    let $ = cheerio.load(html);
+    const $main = cheerio.load(html);
 
-    // 1. Try to find link to m4ulinks.site or similar
-    const $m4uLink = $("a").filter(
-      (_, el) => $(el).attr("href")?.includes("m4ulinks.site") || false,
-    );
-    const m4uUrl = $m4uLink.attr("href");
-
-    if (m4uUrl) {
-      const m4uResponse = await fetchWithRetry(m4uUrl, {}, 2, true);
-      const m4uHtml = await m4uResponse.text();
-      $ = cheerio.load(m4uHtml);
-    }
-
-    // 2. Robust approach: find all Hub-Cloud links, resolve them, then associate with nearest header
-    const hubLinks = $("a")
-      .filter((_, el) => {
-        const url = $(el).attr("href") || "";
-        return url.includes("hubcloud");
-      })
-      .toArray();
-
-    // Process Hub-Cloud links in parallel
-    const linkResolutions = hubLinks.map(async (el) => {
-      const $a = $(el);
-      const originalUrl = $a.attr("href") || "";
-      const linkText = $a.text().trim() || "Download";
-
-      const finalUrl = await robustFetchPixeldrainLink(originalUrl);
-
-      return { $a, linkText, finalUrl };
+    // Find all unique m4ulinks.site URLs on the detail page
+    const m4uUrls: string[] = [];
+    $main("a").each((_, el) => {
+      const href = $main(el).attr("href") || "";
+      if (href.includes("m4ulinks.site") && !m4uUrls.includes(href)) {
+        m4uUrls.push(href);
+      }
     });
 
-    const results = await Promise.allSettled(linkResolutions);
+    async function processCheerioDoc($doc: any) {
+      const hubLinks = $doc("a")
+        .filter((_, el) => {
+          const url = $doc(el).attr("href") || "";
+          return url.includes("hubcloud");
+        })
+        .toArray();
 
-    for (const result of results) {
-      if (result.status === "fulfilled" && result.value.finalUrl) {
-        const { $a, linkText, finalUrl } = result.value;
+      const linkResolutions = hubLinks.map(async (el) => {
+        const $a = $doc(el);
+        const originalUrl = $a.attr("href") || "";
+        let linkText = $a.text().trim() || "Download";
 
-        // Find the closest preceding header
-        let $prev = $a.parent();
-        let $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
-
-        // Traverse up if not found in immediate parent
-        while (!$header.length && $prev.length && !$prev.is("body")) {
-          $prev = $prev.parent();
-          $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
+        if (
+          $a.hasClass("btn-zip") ||
+          linkText.toUpperCase().includes("ZIP") ||
+          linkText.toUpperCase().includes("BATCH")
+        ) {
+          linkText = linkText || "BATCH/ZIP";
         }
 
-        const quality = $header.length > 0 ? $header.text().trim() : "General";
+        const finalUrl = await robustFetchPixeldrainLink(originalUrl);
+        return { $a, linkText, finalUrl };
+      });
 
-        // Add to links array
-        let qualityEntry = links.find((l) => l.quality === quality);
-        if (!qualityEntry) {
-          qualityEntry = { quality: quality, links: [] };
-          links.push(qualityEntry);
+      const results = await Promise.allSettled(linkResolutions);
+
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value.finalUrl) {
+          const { $a, linkText, finalUrl } = result.value;
+
+          let $prev = $a.parent();
+          let $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
+
+          while (!$header.length && $prev.length && !$prev.is("body")) {
+            $prev = $prev.parent();
+            $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
+          }
+
+          let quality = $header.length > 0 ? $header.text().trim() : "General";
+          quality = quality.replace(/^[\s\W]+/g, "").trim();
+          if (!quality) quality = "General";
+
+          addLink(quality, linkText, finalUrl);
         }
-        qualityEntry.links.push({ text: linkText, url: finalUrl });
       }
+    }
+
+    if (m4uUrls.length > 0) {
+      for (const m4uUrl of m4uUrls) {
+        try {
+          console.log(`Scraping unique m4ulinks page: ${m4uUrl}`);
+          const m4uResponse = await fetchWithRetry(m4uUrl, {}, 2, true);
+          const m4uHtml = await m4uResponse.text();
+          const $m4u = cheerio.load(m4uHtml);
+          await processCheerioDoc($m4u);
+        } catch (e) {
+          console.error(`Error scraping m4ulinks page ${m4uUrl}:`, e);
+        }
+      }
+    } else {
+      await processCheerioDoc($main);
     }
   } catch (err) {
     console.error(`Error scraping detail: ${detailUrl}`, err);
@@ -803,8 +894,13 @@ app.post("/api/scrape", async (req, res) => {
           const scraped = await scrapePage(p);
           for (const m of scraped) {
             const normalizedTitle = m.title.replace(/\s+/g, " ").trim();
+            const cleanedTitle = cleanMovieTitle(normalizedTitle);
             const existing = await moviesCol.findOne({
-              title: normalizedTitle,
+              $or: [
+                { detail_url: m.detail_url },
+                { title: normalizedTitle },
+                { cleaned_title: cleanedTitle }
+              ]
             });
             if (!existing) {
               const links = await scrapeMovieDetail(m.detail_url);
@@ -813,6 +909,7 @@ app.post("/api/scrape", async (req, res) => {
               await moviesCol.insertOne({
                 id: nextId,
                 title: normalizedTitle,
+                cleaned_title: cleanedTitle,
                 release_year: m.release_year,
                 quality: m.quality,
                 poster_url: m.poster_url,
@@ -822,6 +919,25 @@ app.post("/api/scrape", async (req, res) => {
                 priority: 0,
               });
               totalScraped++;
+            } else {
+              // Check if new links/episodes have been added
+              const links = await scrapeMovieDetail(m.detail_url);
+              const existingLinksStr = JSON.stringify(existing.links || []);
+              const newLinksStr = JSON.stringify(links);
+              if (newLinksStr !== existingLinksStr) {
+                await moviesCol.updateOne(
+                  { _id: existing._id },
+                  { 
+                    $set: { 
+                      links: links, 
+                      quality: m.quality || existing.quality,
+                      poster_url: m.poster_url || existing.poster_url,
+                      scraped_at: new Date().toISOString() 
+                    } 
+                  }
+                );
+                totalScraped++;
+              }
             }
           }
         } catch (err: any) {
@@ -849,12 +965,21 @@ app.post("/api/scrape", async (req, res) => {
   }
 });
 
-// Delete all movies
+// Delete all movies, seen links, and reset scraper state & ID counter
 app.delete("/api/movies", async (req, res) => {
   try {
     console.log("Received DELETE request to /api/movies");
     await getMoviesCollection().deleteMany({});
-    res.json({ success: true, message: "All movies cleared from database." });
+    await getSeenLinksCollection().deleteMany({});
+    currentFullScrapePage = 1;
+    isFullScrapeDone = false;
+    const counterCol = await getCountersCollection();
+    await counterCol.updateOne(
+      { _id: "movieId" } as any,
+      { $set: { seq: 0 } },
+      { upsert: true }
+    );
+    res.json({ success: true, message: "All movies and seen links cleared. Scraper reset to page 1 and index 1." });
   } catch (err: any) {
     console.error("Error clearing database:", err);
     res.status(500).json({ success: false, error: err.message });
@@ -866,24 +991,25 @@ async function startServer() {
   await initCounter();
   startContinuousScraping();
 
-  // // Vite middleware for development
-  // if (process.env.NODE_ENV !== "production") {
-  //   const vite = await createViteServer({
-  //     server: { middlewareMode: true },
-  //     appType: "spa",
-  //   });
-  //   app.use(vite.middlewares);
-  // } else {
-
-  const distPath = path.join(process.cwd(), "dist");
-  app.use(express.static(distPath));
-  app.get(/.*$/, (req, res) => {
-    res.sendFile(path.join(distPath, "index.html"));
+  // API 404 fallback to return JSON instead of HTML
+  app.all("/api/*", (req, res) => {
+    res.status(404).json({ success: false, error: "API endpoint not found" });
   });
 
-  console.log(path.join(distPath, "index.html"));
-
-  // }
+  // Vite middleware for development or static in production
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
   const listenOnPort = (port: number) => {
     const server = app.listen(port, "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${port}`);
