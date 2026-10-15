@@ -29,6 +29,7 @@ export default function App() {
   const [selectedQuality, setSelectedQuality] = useState("ALL");
   const [selectedPage, setSelectedPage] = useState<string | number>("1"); // Page 1 by default
   const [sortBy, setSortBy] = useState<"newest" | "title" | "year">("newest");
+  const [preferredServer, setPreferredServer] = useState<string>("pixeldrain");
   const [availablePages, setAvailablePages] = useState<(string | number)[]>(["ALL"]);
   const [availableQualities, setAvailableQualities] = useState<string[]>(["ALL"]);
   const [totalCount, setTotalCount] = useState<number>(0);
@@ -36,6 +37,16 @@ export default function App() {
   // Pagination states
   const [resultPage, setResultPage] = useState<number>(1);
   const [matchingCount, setMatchingCount] = useState<number>(0);
+  const [siteUrl, setSiteUrl] = useState<string>("https://new2.movies4u.garden/");
+
+  useEffect(() => {
+    fetch("/api/config")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.siteUrl) setSiteUrl(data.siteUrl);
+      })
+      .catch(() => {});
+  }, []);
 
   const fetchStatus = async () => {
     try {
@@ -52,12 +63,16 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const fetchMovies = async (filters = {
-    search: searchTerm,
-    quality: selectedQuality,
-    pageNum: selectedPage,
-    page: resultPage,
-  }, append = false) => {
+  const fetchMovies = async (
+    filters = {
+      search: searchTerm,
+      quality: selectedQuality,
+      pageNum: selectedPage,
+      page: resultPage,
+      preferredServer: preferredServer,
+    },
+    append = false
+  ) => {
     try {
       setIsLoading(true);
       const params = new URLSearchParams();
@@ -74,12 +89,13 @@ export default function App() {
       if (filters.page) {
         params.append("page", filters.page.toString());
       }
+      params.append("preferredServer", filters.preferredServer || preferredServer);
       params.append("limit", "30");
 
       const res = await fetch(`/api/movies?${params.toString()}`);
       const data = await res.json();
       if (data.success) {
-        setMovies((prev) => append ? [...prev, ...data.movies] : data.movies);
+        setMovies((prev) => (append ? [...prev, ...data.movies] : data.movies));
         setTotalCount(data.total || data.movies.length);
         setMatchingCount(data.matchingCount !== undefined ? data.matchingCount : data.movies.length);
         if (data.pages) {
@@ -100,24 +116,32 @@ export default function App() {
   // Fetch movies reactively on filter changes (resets result page to 1)
   useEffect(() => {
     setResultPage(1);
-    fetchMovies({
-      search: searchTerm,
-      quality: selectedQuality,
-      pageNum: selectedPage,
-      page: 1,
-    }, false);
-  }, [searchTerm, selectedQuality, selectedPage]);
+    fetchMovies(
+      {
+        search: searchTerm,
+        quality: selectedQuality,
+        pageNum: selectedPage,
+        page: 1,
+        preferredServer: preferredServer,
+      },
+      false
+    );
+  }, [searchTerm, selectedQuality, selectedPage, preferredServer]);
 
   // Fetch more movies when page changes (appends to list)
   const loadMoreMovies = () => {
     const nextPage = resultPage + 1;
     setResultPage(nextPage);
-    fetchMovies({
-      search: searchTerm,
-      quality: selectedQuality,
-      pageNum: selectedPage,
-      page: nextPage,
-    }, true);
+    fetchMovies(
+      {
+        search: searchTerm,
+        quality: selectedQuality,
+        pageNum: selectedPage,
+        page: nextPage,
+        preferredServer: preferredServer,
+      },
+      true
+    );
   };
 
 
@@ -205,6 +229,7 @@ export default function App() {
         totalCount={totalCount}
         onClear={handleClearDb}
         isScraping={isScraping}
+        siteUrl={siteUrl}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -223,7 +248,7 @@ export default function App() {
               Scrape movie titles, release years, qualities (Web-DL, HDRip,
               BluRay), poster links, and video source URLs from{" "}
               <span className="text-white font-semibold">
-                new2.movies4u.clinic
+                {siteUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")}
               </span>
               . All data is persisted in a server-side MongoDB database.
             </p>
@@ -321,6 +346,14 @@ export default function App() {
             totalMovies={totalCount}
             onLoadMore={loadMoreMovies}
             hasMore={movies.length < matchingCount}
+            onMovieUpdated={(updatedMovie) => {
+              setMovies((prev) =>
+                prev.map((m) => (m.id === updatedMovie.id ? updatedMovie : m))
+              );
+            }}
+            onRefreshMovies={() => fetchMovies()}
+            preferredServer={preferredServer}
+            onPreferredServerChange={setPreferredServer}
           />
         )}
       </main>

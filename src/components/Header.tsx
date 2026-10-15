@@ -5,9 +5,12 @@ interface HeaderProps {
   totalCount: number;
   onClear: () => void;
   isScraping: boolean;
+  siteUrl?: string;
 }
 
-export const Header: React.FC<HeaderProps> = ({ totalCount, onClear, isScraping }) => {
+export const Header: React.FC<HeaderProps> = ({ totalCount, onClear, isScraping, siteUrl = "new2.movies4u.garden" }) => {
+  const displayHost = siteUrl.replace(/^https?:\/\//, "").replace(/\/$/, "");
+
   return (
     <header className="bg-slate-900 border-b border-slate-800 text-white sticky top-0 z-30 shadow-md">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -20,7 +23,7 @@ export const Header: React.FC<HeaderProps> = ({ totalCount, onClear, isScraping 
               Movies4U Scraper & Library
             </h1>
             <p className="text-xs text-slate-400">
-              Scraped from <span className="text-red-400 font-medium">movies4u.clinic</span> & stored in SQLite
+              Scraped from <span className="text-red-400 font-medium">{displayHost}</span> & stored in MongoDB
             </p>
           </div>
         </div>

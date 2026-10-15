@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for fixing movie scraper link extraction flow, single-server fallback resolution, TV series grouping by quality, and updating site URL display across the application.",
+  "updatedAt": "2026-10-15T14:17:50.494186551Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

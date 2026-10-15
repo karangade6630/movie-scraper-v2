@@ -16,8 +16,8 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 const app = express();
 app.use(express.json());
 const DEFAULT_PORT = Number(process.env.PORT) || 3000;
-let BASE_URL = process.env.SITE_URL || 'https://new5.movies4u.clinic/';
-const linkCache = new Map<string, string>();
+let BASE_URL = process.env.SITE_URL || 'https://new2.movies4u.garden/';
+const linkCache = new Map<string, { text: string; url: string }[]>();
 
 import seenLinksRouter from "./src/seenLinks.ts";
 
@@ -105,6 +105,7 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
           release_year: m.release_year,
           quality: m.quality,
           poster_url: m.poster_url,
+          detail_url: m.detail_url,
           links: links,
           page_num: pageNum,
           scraped_at: new Date().toISOString(),
@@ -269,110 +270,395 @@ async function getNextMovieId(): Promise<number> {
   return result && typeof result.seq === "number" ? result.seq : Date.now();
 }
 
-async function scrapeMovieDetail(detailUrl: string) {
-  const links: { quality: string; links: { text: string; url: string }[] }[] = [];
-  
-  function addLink(quality: string, text: string, url: string) {
+// Extract direct download links from HubCloud generator flow with customizable server priority (Pixeldrain by default)
+interface HubCloudOptions {
+  pixeldrain?: string;
+  fsl?: string;
+  tenGbps?: string;
+  direct?: { text: string; url: string };
+  hubUrl: string;
+}
+const hubOptionsCache = new Map<string, HubCloudOptions>();
+
+async function resolveHubCloudDirectLinks(
+  hubUrl: string,
+  preferredServer: string = "pixeldrain",
+): Promise<{ text: string; url: string; alternatives?: { text: string; url: string }[] }[]> {
+  try {
+    let opts = hubOptionsCache.get(hubUrl);
+
+    if (!opts) {
+      opts = { hubUrl };
+      const hubResponse = await fetchWithRetry(hubUrl, {}, 2, false);
+      const html = await hubResponse.text();
+      const $ = cheerio.load(html);
+
+      // Check if Pixeldrain is directly present in HubCloud HTML
+      const pxlDirectMatch = html.match(/var\s+pxl\s*=\s*["']([^"']+)["']/);
+      if (pxlDirectMatch && pxlDirectMatch[1]) {
+        opts.pixeldrain = pxlDirectMatch[1].replace("/u/", "/api/file/");
+      }
+
+      if (!opts.pixeldrain) {
+        $("a").each((_, a) => {
+          const href = $(a).attr("href") || "";
+          if (/pixeldrain\.(com|dev)/i.test(href)) {
+            opts!.pixeldrain = href.replace("/u/", "/api/file/");
+          }
+        });
+      }
+
+      // Check generator button
+      const $generateBtn = $(
+        "#download, a:contains('Generate Direct Download Link'), a:contains('Generate'), a:contains('Go to download')",
+      );
+      let rawGenUrl = $generateBtn.attr("href");
+
+      if (rawGenUrl) {
+        const genUrl = rawGenUrl.startsWith("http") ? rawGenUrl : new URL(rawGenUrl, hubUrl).href;
+        const genRes = await fetchWithRetry(genUrl, { headers: { Referer: hubUrl } }, 2, false);
+        if (genRes.ok) {
+          const genHtml = await genRes.text();
+          const $g = cheerio.load(genHtml);
+
+          if (!opts.pixeldrain) {
+            const pxlGenMatch = genHtml.match(/var\s+pxl\s*=\s*["']([^"']+)["']/);
+            if (pxlGenMatch && pxlGenMatch[1]) {
+              opts.pixeldrain = pxlGenMatch[1].replace("/u/", "/api/file/");
+            }
+          }
+
+          $g("a").each((_, a) => {
+            const text = $g(a).text().trim();
+            const href = $g(a).attr("href") || "";
+            if (
+              href.startsWith("http") &&
+              !href.includes("google.com") &&
+              !href.includes("t.me") &&
+              !href.includes("tinyurl") &&
+              !href.includes("one.one.one.one")
+            ) {
+              if (/pixeldrain\.(com|dev)/i.test(href) && !opts!.pixeldrain) {
+                opts!.pixeldrain = href.replace("/u/", "/api/file/");
+              } else if (!opts!.fsl && (/FSL Server|Cloudflare|r2\.cloudflarestorage/i.test(text) || href.includes("r2.cloudflarestorage.com"))) {
+                opts!.fsl = href;
+              } else if (!opts!.tenGbps && (/10Gbps|gpdl\.hubcloud/i.test(text) || href.includes("gpdl.hubcloud"))) {
+                opts!.tenGbps = href;
+              } else if (!opts!.direct && /Fast Server|Direct Download|Download Server/i.test(text)) {
+                opts!.direct = { text: text || "Direct Server", url: href };
+              }
+            }
+          });
+        }
+      }
+
+      hubOptionsCache.set(hubUrl, opts);
+    }
+
+    // Build all available alternatives
+    const allAlts: { text: string; url: string }[] = [];
+    if (opts.pixeldrain) allAlts.push({ text: "Pixeldrain", url: opts.pixeldrain });
+    if (opts.fsl) allAlts.push({ text: "FSL Server", url: opts.fsl });
+    if (opts.tenGbps) allAlts.push({ text: "10Gbps Server", url: opts.tenGbps });
+    if (opts.direct) allAlts.push({ text: opts.direct.text, url: opts.direct.url });
+    allAlts.push({ text: "HubCloud DD", url: hubUrl });
+
+    // Pick strictly ONE single link according to user preferredServer
+    const pref = (preferredServer || "pixeldrain").toLowerCase();
+    let selected: { text: string; url: string } | null = null;
+
+    if (pref.includes("fsl") && opts.fsl) {
+      selected = { text: "FSL Server", url: opts.fsl };
+    } else if (pref.includes("10g") && opts.tenGbps) {
+      selected = { text: "10Gbps Server", url: opts.tenGbps };
+    } else if (pref.includes("hub") && hubUrl) {
+      selected = { text: "HubCloud DD", url: hubUrl };
+    } else if (pref.includes("pixel") && opts.pixeldrain) {
+      selected = { text: "Pixeldrain", url: opts.pixeldrain };
+    }
+
+    // Priority fallback if preferred wasn't found: Pixeldrain > FSL > 10Gbps > Direct > HubCloud
+    if (!selected) {
+      if (opts.pixeldrain) selected = { text: "Pixeldrain", url: opts.pixeldrain };
+      else if (opts.fsl) selected = { text: "FSL Server", url: opts.fsl };
+      else if (opts.tenGbps) selected = { text: "10Gbps Server", url: opts.tenGbps };
+      else if (opts.direct) selected = { text: opts.direct.text, url: opts.direct.url };
+      else selected = { text: "HubCloud DD", url: hubUrl };
+    }
+
+    return [{ ...selected, alternatives: allAlts }];
+  } catch (err) {
+    console.error(`Failed to resolve direct links for HubCloud ${hubUrl}:`, err);
+    return [{ text: "HubCloud DD", url: hubUrl, alternatives: [{ text: "HubCloud DD", url: hubUrl }] }];
+  }
+}
+
+async function scrapeMovieDetail(detailUrl: string, preferredServer: string = "pixeldrain") {
+  const qualityGroups: Map<string, { text: string; url: string; alternatives?: { text: string; url: string }[] }[]> = new Map();
+
+  const pref = (preferredServer || "pixeldrain").toLowerCase();
+
+  const getScore = (label: string) => {
+    const t = label.toLowerCase();
+    if (pref.includes("fsl") && (t.includes("fsl") || t.includes("direct"))) return 100;
+    if (pref.includes("10g") && t.includes("10gbps")) return 100;
+    if (pref.includes("pixel") && t.includes("pixel")) return 100;
+    if (pref.includes("gdflix") && t.includes("gdflix")) return 100;
+    if (pref.includes("hub") && t.includes("hub")) return 100;
+
+    // Default priority: Pixeldrain > FSL > 10Gbps > Direct > HubCloud > GDFlix
+    if (t.includes("pixel")) return 90;
+    if (t.includes("fsl") || t.includes("r2")) return 80;
+    if (t.includes("10gbps") || t.includes("10g")) return 70;
+    if (t.includes("direct")) return 60;
+    if (t.includes("hub")) return 50;
+    return 10;
+  };
+
+  function addLink(
+    quality: string,
+    text: string,
+    url: string,
+    alternatives: { text: string; url: string }[] = [],
+  ) {
     if (!url) return;
-    let qualityEntry = links.find((l) => l.quality === quality);
-    if (!qualityEntry) {
-      qualityEntry = { quality: quality, links: [] };
-      links.push(qualityEntry);
+    const cleanQ = quality.trim() || "General";
+    if (!qualityGroups.has(cleanQ)) {
+      qualityGroups.set(cleanQ, []);
     }
-    if (!qualityEntry.links.some((l) => l.url === url)) {
-      qualityEntry.links.push({ text, url });
+    const group = qualityGroups.get(cleanQ)!;
+
+    const epMatch = text.match(/^(Ep\s*\d+|Batch\s*Zip)/i);
+
+    if (epMatch) {
+      const epPrefix = epMatch[1].toLowerCase();
+      const existingIdx = group.findIndex((l) => l.text.toLowerCase().startsWith(epPrefix));
+      if (existingIdx !== -1) {
+        const existing = group[existingIdx];
+        const mergedAlts = [
+          ...(existing.alternatives || [{ text: existing.text, url: existing.url }]),
+          ...(alternatives || []),
+          { text, url },
+        ].filter((a, idx, arr) => arr.findIndex((x) => x.url === a.url) === idx);
+
+        if (getScore(text) > getScore(existing.text)) {
+          group[existingIdx] = { text, url, alternatives: mergedAlts };
+        } else {
+          group[existingIdx].alternatives = mergedAlts;
+        }
+        return;
+      }
+    } else {
+      // Movie quality level: STRICTLY MAINTAIN 1 LINK PER QUALITY!
+      if (group.length > 0) {
+        const existing = group[0];
+        const mergedAlts = [
+          ...(existing.alternatives || [{ text: existing.text, url: existing.url }]),
+          ...(alternatives || []),
+          { text, url },
+        ].filter((a, idx, arr) => arr.findIndex((x) => x.url === a.url) === idx);
+
+        if (getScore(text) > getScore(existing.text)) {
+          group[0] = { text, url, alternatives: mergedAlts };
+        } else {
+          group[0].alternatives = mergedAlts;
+        }
+        return;
+      }
     }
+
+    const initialAlts = alternatives.length > 0 ? alternatives : [{ text, url }];
+    group.push({ text, url, alternatives: initialAlts });
   }
 
   try {
-    const response = await fetch(detailUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      },
-    });
+    const response = await fetchWithRetry(detailUrl, {}, 2, false);
     const html = await response.text();
     const $main = cheerio.load(html);
 
-    // Find all unique m4ulinks.site URLs on the detail page
-    const m4uUrls: string[] = [];
+    // Find all unique m4ulinks (matching any m4ulinks.* domain)
+    const m4uEntries: { url: string; contextHeader: string }[] = [];
     $main("a").each((_, el) => {
       const href = $main(el).attr("href") || "";
-      if (href.includes("m4ulinks.site") && !m4uUrls.includes(href)) {
-        m4uUrls.push(href);
+      if (/m4ulinks/i.test(href)) {
+        if (!m4uEntries.some((e) => e.url === href)) {
+          let header =
+            $main(el).prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim() ||
+            $main(el).parent().prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim() ||
+            $main(el).parent().parent().prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim();
+          m4uEntries.push({ url: href, contextHeader: header });
+        }
       }
     });
 
-    async function processCheerioDoc($doc: any) {
-      const hubLinks = $doc("a")
-        .filter((_, el) => {
-          const url = $doc(el).attr("href") || "";
-          return url.includes("hubcloud");
-        })
-        .toArray();
-
-      const linkResolutions = hubLinks.map(async (el) => {
-        const $a = $doc(el);
-        const originalUrl = $a.attr("href") || "";
-        let linkText = $a.text().trim() || "Download";
-
-        if (
-          $a.hasClass("btn-zip") ||
-          linkText.toUpperCase().includes("ZIP") ||
-          linkText.toUpperCase().includes("BATCH")
-        ) {
-          linkText = linkText || "BATCH/ZIP";
-        }
-
-        const finalUrl = await robustFetchPixeldrainLink(originalUrl);
-        return { $a, linkText, finalUrl };
-      });
-
-      const results = await Promise.allSettled(linkResolutions);
-
-      for (const result of results) {
-        if (result.status === "fulfilled" && result.value.finalUrl) {
-          const { $a, linkText, finalUrl } = result.value;
-
-          let $prev = $a.parent();
-          let $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
-
-          while (!$header.length && $prev.length && !$prev.is("body")) {
-            $prev = $prev.parent();
-            $header = $prev.prevAll("h2, h3, h4, h5, strong").first();
-          }
-
-          let quality = $header.length > 0 ? $header.text().trim() : "General";
-          quality = quality.replace(/^[\s\W]+/g, "").trim();
-          if (!quality) quality = "General";
-
-          addLink(quality, linkText, finalUrl);
-        }
-      }
-    }
-
-    if (m4uUrls.length > 0) {
-      for (const m4uUrl of m4uUrls) {
+    if (m4uEntries.length > 0) {
+      for (const entry of m4uEntries) {
         try {
-          console.log(`Scraping unique m4ulinks page: ${m4uUrl}`);
-          const m4uResponse = await fetchWithRetry(m4uUrl, {}, 2, true);
-          const m4uHtml = await m4uResponse.text();
+          console.log(`Scraping m4ulinks page: ${entry.url}`);
+          const m4uRes = await fetchWithRetry(entry.url, {}, 2, false);
+          const m4uHtml = await m4uRes.text();
           const $m4u = cheerio.load(m4uHtml);
-          await processCheerioDoc($m4u);
+          const pageTitle = $m4u("title").text().trim();
+
+          const downloadLinks = $m4u("a").filter((_, el) => {
+            const h = $m4u(el).attr("href") || "";
+            return /hubcloud|gdflix|pixeldrain/i.test(h);
+          }).toArray();
+
+          interface SectionItem {
+            headerText: string;
+            pixeldrainUrl?: string;
+            hubCloudUrl?: string;
+            gdFlixUrl?: string;
+            isZipBatch: boolean;
+          }
+          const sections: SectionItem[] = [];
+
+          downloadLinks.forEach((el) => {
+            const $a = $m4u(el);
+            const href = $a.attr("href") || "";
+            const text = $a.text().trim();
+            const isZip = $a.hasClass("btn-zip") || /zip|batch/i.test(text) || /zip|batch/i.test(href);
+
+            let header =
+              $a.prevAll("h1, h2, h3, h4, h5, p, strong, div.badge, div.alert").first().text().trim() ||
+              $a.parent().prevAll("h1, h2, h3, h4, h5, p, strong, div.badge, div.alert").first().text().trim() ||
+              $a.parent().parent().prevAll("h1, h2, h3, h4, h5, p, strong").first().text().trim();
+            header = header.replace(/\s+/g, " ").trim();
+
+            if (!header) {
+              header = entry.contextHeader || pageTitle || "Download";
+            }
+
+            let sec = sections.find((s) => s.headerText === header);
+            if (!sec) {
+              sec = { headerText: header, isZipBatch: isZip };
+              sections.push(sec);
+            }
+            if (/pixeldrain/i.test(href)) {
+              sec.pixeldrainUrl = href;
+            } else if (/hubcloud/i.test(href)) {
+              sec.hubCloudUrl = href;
+            } else if (/gdflix/i.test(href)) {
+              sec.gdFlixUrl = href;
+            }
+          });
+
+          // Single-server resolution with server priority (Pixeldrain default):
+          for (const sec of sections) {
+            let quality = "General";
+            const combinedContext = `${entry.contextHeader} ${pageTitle} ${sec.headerText}`;
+            if (/2160p|4k/i.test(combinedContext)) quality = "4K / 2160P";
+            else if (/1080p/i.test(combinedContext)) quality = "1080P";
+            else if (/720p/i.test(combinedContext)) quality = "720P";
+            else if (/480p/i.test(combinedContext)) quality = "480P";
+
+            let labelPrefix = "";
+            const epMatch = sec.headerText.match(/episode[s\s:]*(\d+)/i) || sec.headerText.match(/ep[s\s:]*(\d+)/i);
+            if (epMatch) {
+              labelPrefix = `Ep ${epMatch[1].padStart(2, "0")}`;
+            } else if (sec.isZipBatch || /batch|zip/i.test(sec.headerText)) {
+              labelPrefix = "Batch Zip";
+            }
+
+            // Gather all available alternatives for this section
+            const secAlts: { text: string; url: string }[] = [];
+            if (sec.pixeldrainUrl) {
+              secAlts.push({
+                text: labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain",
+                url: sec.pixeldrainUrl.replace("/u/", "/api/file/"),
+              });
+            }
+            if (sec.gdFlixUrl) {
+              secAlts.push({
+                text: labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix",
+                url: sec.gdFlixUrl,
+              });
+            }
+
+            let resolvedSuccess = false;
+
+            // If user prefers GDFlix and it is available
+            if (pref.includes("gdflix") && sec.gdFlixUrl) {
+              resolvedSuccess = true;
+              const finalLabel = labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix";
+              addLink(quality, finalLabel, sec.gdFlixUrl, secAlts);
+            } else if (pref.includes("pixel") && sec.pixeldrainUrl) {
+              // Direct Pixeldrain
+              resolvedSuccess = true;
+              const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
+              const finalLabel = labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain";
+              addLink(quality, finalLabel, cleanPxl, secAlts);
+            } else if (sec.hubCloudUrl) {
+              // HubCloud resolution (picks best server matching preferredServer)
+              const directLinks = await resolveHubCloudDirectLinks(sec.hubCloudUrl, preferredServer);
+              if (directLinks.length > 0) {
+                resolvedSuccess = true;
+                const dl = directLinks[0];
+                const finalLabel = labelPrefix ? `${labelPrefix} (${dl.text})` : dl.text;
+                const combinedAlts = [
+                  ...secAlts,
+                  ...(dl.alternatives || []).map((a) => ({
+                    text: labelPrefix ? `${labelPrefix} (${a.text})` : a.text,
+                    url: a.url,
+                  })),
+                ].filter((a, idx, arr) => arr.findIndex((x) => x.url === a.url) === idx);
+
+                addLink(quality, finalLabel, dl.url, combinedAlts);
+              }
+            } else if (sec.pixeldrainUrl) {
+              resolvedSuccess = true;
+              const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
+              const finalLabel = labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain";
+              addLink(quality, finalLabel, cleanPxl, secAlts);
+            }
+
+            // Fallback: GDFlix only if primary not resolved
+            if (!resolvedSuccess && sec.gdFlixUrl) {
+              const finalLabel = labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix";
+              addLink(quality, finalLabel, sec.gdFlixUrl, secAlts);
+            }
+          }
         } catch (e) {
-          console.error(`Error scraping m4ulinks page ${m4uUrl}:`, e);
+          console.error(`Error scraping m4ulinks page ${entry.url}:`, e);
         }
       }
     } else {
-      await processCheerioDoc($main);
+      console.log(`No m4ulinks found on ${detailUrl}, checking direct links...`);
+      const hubLinks = $main("a").filter((_, el) => {
+        const url = $main(el).attr("href") || "";
+        return /hubcloud|pixeldrain|drive/i.test(url);
+      }).toArray();
+
+      for (const el of hubLinks) {
+        const href = $main(el).attr("href") || "";
+        const text = $main(el).text().trim() || "Download";
+        if (/pixeldrain/i.test(href)) {
+          addLink("General", "Pixeldrain", href.replace("/u/", "/api/file/"), [{ text: "Pixeldrain", url: href.replace("/u/", "/api/file/") }]);
+        } else if (/hubcloud/i.test(href)) {
+          const directLinks = await resolveHubCloudDirectLinks(href, preferredServer);
+          if (directLinks.length > 0) {
+            const dl = directLinks[0];
+            addLink("General", dl.text, dl.url, dl.alternatives || [{ text: dl.text, url: dl.url }]);
+          }
+        } else {
+          addLink("General", text, href, [{ text, url: href }]);
+        }
+      }
     }
   } catch (err) {
     console.error(`Error scraping detail: ${detailUrl}`, err);
   }
+
+  const links: { quality: string; links: { text: string; url: string; alternatives?: { text: string; url: string }[] }[] }[] = [];
+  qualityGroups.forEach((groupLinks, quality) => {
+    links.push({ quality, links: groupLinks });
+  });
+
   return links;
 }
 
-// Helper to fetch with retries
+// Helper to fetch with retries and direct fallback
 async function fetchWithRetry(
   url: string,
   options: any = {},
@@ -382,7 +668,7 @@ async function fetchWithRetry(
   for (let i = 0; i <= retries; i++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
+      const timeout = setTimeout(() => controller.abort(), 12000);
 
       const fetchOptions: any = {
         ...options,
@@ -395,18 +681,21 @@ async function fetchWithRetry(
       };
 
       if (useProxy) {
-        const proxiesCol = getProxiesCollection();
-        const randomProxyArr = await proxiesCol
-          .aggregate([
-            { $match: { latency: { $ne: null } } },
-            { $sample: { size: 1 } },
-          ])
-          .toArray();
-        const proxy = randomProxyArr[0];
-        if (proxy) {
-          console.log(`Using proxy: ${proxy.url}`);
-          // @ts-ignore
-          fetchOptions.agent = new HttpsProxyAgent(`http://${proxy.url}`);
+        try {
+          const proxiesCol = getProxiesCollection();
+          const randomProxyArr = await proxiesCol
+            .aggregate([
+              { $match: { latency: { $ne: null } } },
+              { $sample: { size: 1 } },
+            ])
+            .toArray();
+          const proxy = randomProxyArr[0];
+          if (proxy) {
+            // @ts-ignore
+            fetchOptions.agent = new HttpsProxyAgent(`http://${proxy.url}`);
+          }
+        } catch {
+          // ignore proxy error
         }
       }
 
@@ -416,55 +705,16 @@ async function fetchWithRetry(
       if (response.ok) return response;
       throw new Error(`HTTP error! status: ${response.status}`);
     } catch (e) {
+      if (useProxy && i === 0) {
+        // Retry immediately direct without proxy
+        useProxy = false;
+        continue;
+      }
       if (i === retries) throw e;
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 1500));
     }
   }
   throw new Error("Max retries exceeded");
-}
-
-// Robustly extract Pixeldrain link following the site flow
-async function robustFetchPixeldrainLink(url: string): Promise<string> {
-  const cachedUrl = linkCache.get(url);
-  if (cachedUrl) return cachedUrl;
-
-  try {
-    // Step 1: Fetch Main Page
-    const hubResponse = await fetchWithRetry(url, {}, 2, true);
-    let html = await hubResponse.text();
-
-    // Step 2: Check for "Generate" flow
-    let $ = cheerio.load(html);
-    const $generateBtn = $(
-      "#download, a:contains('Generate'), a:contains('Go to download')",
-    );
-
-    if ($generateBtn.length > 0) {
-      const rawGenerateUrl = $generateBtn.attr("href");
-      if (rawGenerateUrl) {
-        const generateUrl = new URL(rawGenerateUrl, url).href;
-        const finalResponse = await fetchWithRetry(generateUrl, {}, 2, true);
-        html = await finalResponse.text();
-        // const htmlContent = `<!-- paste your HTML string here -->`;
-
-        // Extract the URL assigned to the `pxl` variable
-      }
-    }
-
-    // Step 3: Extract from JS variable
-    const match = html.match(/var\s+pxl\s*=\s*["']([^"']+)["']/);
-
-    if (match && match[1]) {
-      const finalUrl = match[1].replace("/u/", "/api/file/");
-      linkCache.set(url, finalUrl);
-      return finalUrl;
-    }
-
-    return null; // Return null instead of throwing or original URL
-  } catch (e) {
-    console.error(`Failed to resolve Pixeldrain link for ${url}:`, e);
-    return null; // Return null on failure
-  }
 }
 
 async function fetchAndRefreshProxies() {
@@ -630,7 +880,7 @@ async function scrapePage(pageNum: number) {
         poster_url:
           posterUrl ||
           "https://images.unsplash.com/photo-1485846234645-a62644f84728?w=500&auto=format&fit=crop&q=60",
-        detail_url: videoUrl || "https://new2.movies4u.clinic/",
+        detail_url: videoUrl || BASE_URL,
         page_num: pageNum,
       });
     }
@@ -684,14 +934,102 @@ async function scrapePage(pageNum: number) {
   return movies;
 }
 
+function deduplicateMovieLinks(linksRaw: any, preferredServer: string = "pixeldrain"): string {
+  let groups: { quality: string; links: any[] }[] = [];
+  try {
+    groups = typeof linksRaw === "string" ? JSON.parse(linksRaw) : linksRaw;
+  } catch {
+    return "[]";
+  }
+  if (!Array.isArray(groups)) return "[]";
+
+  const result: { quality: string; links: any[] }[] = [];
+  const pref = (preferredServer || "pixeldrain").toLowerCase();
+
+  const getScore = (label: string) => {
+    const t = (label || "").toLowerCase();
+    if (pref.includes("fsl") && (t.includes("fsl") || t.includes("direct"))) return 100;
+    if (pref.includes("10g") && t.includes("10gbps")) return 100;
+    if (pref.includes("pixel") && t.includes("pixel")) return 100;
+    if (pref.includes("gdflix") && t.includes("gdflix")) return 100;
+    if (pref.includes("hub") && t.includes("hub")) return 100;
+
+    // Default priority: Pixeldrain > FSL > 10Gbps > Direct > HubCloud > GDFlix
+    if (t.includes("pixel")) return 90;
+    if (t.includes("fsl") || t.includes("r2")) return 80;
+    if (t.includes("10gbps") || t.includes("10g")) return 70;
+    if (t.includes("direct")) return 60;
+    if (t.includes("hub")) return 50;
+    return 10;
+  };
+
+  for (const g of groups) {
+    if (!g || !Array.isArray(g.links)) continue;
+
+    const epMap = new Map<string, any>();
+    let movieLink: any = null;
+
+    for (const link of g.links) {
+      if (!link || !link.url) continue;
+      const epMatch = link.text.match(/^(Ep\s*\d+|Batch\s*Zip)/i);
+
+      if (epMatch) {
+        const epKey = epMatch[1].toLowerCase();
+        const existing = epMap.get(epKey);
+        const mergedAlts = [
+          ...(existing?.alternatives || (existing ? [{ text: existing.text, url: existing.url }] : [])),
+          ...(link.alternatives || []),
+          { text: link.text, url: link.url },
+        ].filter((a: any, idx: number, arr: any[]) => arr.findIndex((x: any) => x.url === a.url) === idx);
+
+        if (!existing || getScore(link.text) > getScore(existing.text)) {
+          epMap.set(epKey, { ...link, alternatives: mergedAlts });
+        } else {
+          epMap.set(epKey, { ...existing, alternatives: mergedAlts });
+        }
+      } else {
+        const mergedAlts = [
+          ...(movieLink?.alternatives || (movieLink ? [{ text: movieLink.text, url: movieLink.url }] : [])),
+          ...(link.alternatives || []),
+          { text: link.text, url: link.url },
+        ].filter((a: any, idx: number, arr: any[]) => arr.findIndex((x: any) => x.url === a.url) === idx);
+
+        if (!movieLink || getScore(link.text) > getScore(movieLink.text)) {
+          movieLink = { ...link, alternatives: mergedAlts };
+        } else {
+          movieLink = { ...movieLink, alternatives: mergedAlts };
+        }
+      }
+    }
+
+    const cleanLinks: any[] = [];
+    if (movieLink) {
+      cleanLinks.push(movieLink);
+    }
+    epMap.forEach((val) => cleanLinks.push(val));
+
+    if (cleanLinks.length > 0) {
+      result.push({
+        quality: g.quality,
+        links: cleanLinks,
+      });
+    }
+  }
+
+  return JSON.stringify(result);
+}
+
 // API Routes
 app.use("/api/seen-links", seenLinksRouter);
 
+app.get("/api/config", (req, res) => {
+  res.json({ siteUrl: BASE_URL });
+});
+
 // Get all movies or filter by search / page range
 app.get("/api/movies", async (req, res) => {
-  console.log("GET /api/movies called with query:", req.query);
   try {
-    const { search, quality, pageMin, pageMax, pageNum, page, limit } =
+    const { search, quality, pageMin, pageMax, pageNum, page, limit, preferredServer } =
       req.query;
 
     const pageFilter = parseInt(page as string) || 1;
@@ -733,14 +1071,17 @@ app.get("/api/movies", async (req, res) => {
 
     const movies = await moviesCol
       .find(filter)
-      .sort({ priority: -1, id: -1 }) // Prioritized first, and latest scraped first
+      .sort({ priority: -1, id: -1 })
       .skip(skip)
       .limit(limitFilter)
       .toArray();
 
+    const globalPref = (preferredServer as string) || "pixeldrain";
+
     const mappedMovies = movies.map((m: any) => ({
       ...m,
-      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links),
+      preferred_server: m.preferred_server || globalPref,
+      links: deduplicateMovieLinks(m.links, m.preferred_server || globalPref),
     }));
 
     const totalCount = await moviesCol.countDocuments({});
@@ -764,23 +1105,22 @@ app.get("/api/movies", async (req, res) => {
 });
 
 app.get("/api/movies-to-download", async (req, res) => {
-  console.log("GET /api/movies called with query:", req.query);
   try {
     const filter: any = {};
-
     const moviesCol = getMoviesCollection();
     const matchingCount = await moviesCol.countDocuments(filter);
 
     const movies = await moviesCol
       .find(filter)
-      .sort({ priority: -1, id: -1 }) // Prioritized first, and latest scraped first
-      // .skip(skip)
-      // .limit(limitFilter)
+      .sort({ priority: -1, id: -1 })
       .toArray();
+
+    const globalPref = (req.query.preferredServer as string) || "pixeldrain";
 
     const mappedMovies = movies.map((m: any) => ({
       ...m,
-      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links),
+      preferred_server: m.preferred_server || globalPref,
+      links: deduplicateMovieLinks(m.links, m.preferred_server || globalPref),
     }));
 
     const totalCount = await moviesCol.countDocuments({});
@@ -823,13 +1163,265 @@ app.patch("/api/movies/:id/priority", async (req, res) => {
   }
 });
 
+async function resolveMovieDetailUrl(movie: any): Promise<string> {
+  // 1. Try to fix domain if it's the old one
+  if (movie.detail_url && movie.detail_url.includes(".clinic")) {
+    const newUrl = movie.detail_url.replace(".clinic", ".garden");
+    // Quick validation: just return it if it looks like a valid URL
+    if (newUrl.startsWith("http")) return newUrl;
+  }
+
+  // 2. Return if already valid and not needing fix
+  if (movie.detail_url && movie.detail_url.startsWith("http")) {
+    return movie.detail_url;
+  }
+
+  // 3. Auto-search site by movie title
+  try {
+    const cleanWords = cleanMovieTitle(movie.title)
+      .split(" ")
+      .filter((w) => w.length > 2)
+      .slice(0, 3)
+      .join(" ");
+
+    const searchUrl = `${BASE_URL.replace(/\/$/, "")}/?s=${encodeURIComponent(cleanWords)}`;
+    const res = await fetchWithRetry(searchUrl, {}, 2, false);
+    if (res.ok) {
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      let matchedHref = "";
+      $("article, .item, .movies-item, .post, .box, a").each((_, el) => {
+        const href = $(el).attr("href") || $(el).find("a").attr("href") || "";
+        const titleText = $(el).text().toLowerCase();
+        if (href.startsWith("http") && href.length > 25 && !href.includes("?s=") && !href.includes("category")) {
+          if (!matchedHref && titleText.includes(cleanWords.toLowerCase().slice(0, 5))) {
+            matchedHref = href;
+          }
+        }
+      });
+      if (matchedHref) return matchedHref;
+    }
+  } catch (e) {
+    console.error("Failed to auto-search detail_url:", e);
+  }
+
+  return movie.detail_url || BASE_URL;
+}
+
+// On-demand fetch/refresh links for all qualities of a single movie with server preference
+app.post("/api/movies/:id/fetch-links", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preferredServer } = req.body || {};
+    const moviesCol = getMoviesCollection();
+    const movie = await moviesCol.findOne({ id: Number(id) });
+    if (!movie) {
+      return res.status(404).json({ success: false, error: "Movie not found" });
+    }
+
+    const chosenPref = preferredServer || movie.preferred_server || "pixeldrain";
+    const targetUrl = await resolveMovieDetailUrl(movie);
+    const links = await scrapeMovieDetail(targetUrl, chosenPref);
+
+    await moviesCol.updateOne(
+      { id: Number(id) },
+      {
+        $set: {
+          detail_url: targetUrl,
+          links: links,
+          preferred_server: chosenPref,
+          scraped_at: new Date().toISOString(),
+        },
+      }
+    );
+
+    const updated = await moviesCol.findOne({ id: Number(id) });
+    res.json({
+      success: true,
+      movie: {
+        ...updated,
+        links: deduplicateMovieLinks(updated.links, chosenPref),
+      },
+      links: deduplicateMovieLinks(links, chosenPref),
+    });
+  } catch (err: any) {
+    console.error("Error fetching links for movie:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Update preferred server selection for a movie and re-deduplicate active links
+app.patch("/api/movies/:id/preferred-server", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preferredServer } = req.body;
+    const moviesCol = getMoviesCollection();
+    const movie = await moviesCol.findOne({ id: Number(id) });
+    if (!movie) {
+      return res.status(404).json({ success: false, error: "Movie not found" });
+    }
+
+    const chosenPref = preferredServer || "pixeldrain";
+    const dedupedStr = deduplicateMovieLinks(movie.links, chosenPref);
+    const dedupedParsed = JSON.parse(dedupedStr);
+
+    await moviesCol.updateOne(
+      { id: Number(id) },
+      { $set: { preferred_server: chosenPref, links: dedupedParsed } }
+    );
+
+    const updated = await moviesCol.findOne({ id: Number(id) });
+    res.json({
+      success: true,
+      movie: {
+        ...updated,
+        preferred_server: chosenPref,
+        links: dedupedStr,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Switch active server for a specific quality in a movie from alternatives
+app.put("/api/movies/:id/select-server", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quality, targetServerText, targetUrl } = req.body;
+    const moviesCol = getMoviesCollection();
+    const movie = await moviesCol.findOne({ id: Number(id) });
+    if (!movie) {
+      return res.status(404).json({ success: false, error: "Movie not found" });
+    }
+
+    let groups: any[] = [];
+    try {
+      groups = typeof movie.links === "string" ? JSON.parse(movie.links) : movie.links;
+    } catch {
+      groups = [];
+    }
+
+    const updatedGroups = groups.map((g: any) => {
+      if (g.quality.toUpperCase() === quality.toUpperCase()) {
+        const newLinks = g.links.map((link: any) => {
+          // Update the active text & url to the target server
+          const currentAlts = link.alternatives || [{ text: link.text, url: link.url }];
+          return {
+            ...link,
+            text: targetServerText,
+            url: targetUrl,
+            alternatives: currentAlts,
+          };
+        });
+        return { ...g, links: newLinks };
+      }
+      return g;
+    });
+
+    await moviesCol.updateOne(
+      { id: Number(id) },
+      { $set: { links: updatedGroups } }
+    );
+
+    const updated = await moviesCol.findOne({ id: Number(id) });
+    res.json({
+      success: true,
+      movie: {
+        ...updated,
+        links: JSON.stringify(updatedGroups),
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Update or manually add/edit links for a movie
+app.put("/api/movies/:id/links", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { links } = req.body;
+    let parsedLinks: any = links;
+    if (typeof links === "string") {
+      try {
+        parsedLinks = JSON.parse(links);
+      } catch {
+        parsedLinks = [];
+      }
+    }
+
+    const moviesCol = getMoviesCollection();
+    await moviesCol.updateOne(
+      { id: Number(id) },
+      { $set: { links: parsedLinks } }
+    );
+
+    res.json({
+      success: true,
+      message: "Movie links updated successfully",
+      links: deduplicateMovieLinks(parsedLinks),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Batch fetch links for selected movies with preferredServer option
+app.post("/api/movies/batch-fetch-links", async (req, res) => {
+  try {
+    const { ids, preferredServer } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, error: "No movie IDs provided" });
+    }
+
+    const chosenPref = preferredServer || "pixeldrain";
+    const moviesCol = getMoviesCollection();
+    let updatedCount = 0;
+
+    for (const id of ids) {
+      const movie = await moviesCol.findOne({ id: Number(id) });
+      if (movie) {
+        try {
+          const targetUrl = await resolveMovieDetailUrl(movie);
+          const links = await scrapeMovieDetail(targetUrl, chosenPref);
+          await moviesCol.updateOne(
+            { id: Number(id) },
+            {
+              $set: {
+                detail_url: targetUrl,
+                links: links,
+                preferred_server: chosenPref,
+                scraped_at: new Date().toISOString(),
+              },
+            }
+          );
+          updatedCount++;
+        } catch (e) {
+          console.error(`Failed to batch fetch links for movie #${id}:`, e);
+        }
+      }
+    }
+
+    const allMovies = await moviesCol.find({ id: { $in: ids.map(Number) } }).toArray();
+    const mappedMovies = allMovies.map((m: any) => ({
+        ...m,
+        links: deduplicateMovieLinks(m.links, m.preferred_server || chosenPref)
+    }));
+
+    res.json({ success: true, updatedCount, movies: mappedMovies });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Get raw database content
 app.get("/api/db-dump", async (req, res) => {
   try {
     const movies = await getMoviesCollection().find({}).toArray();
     const mappedMovies = movies.map((m: any) => ({
       ...m,
-      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links),
+      links: deduplicateMovieLinks(m.links),
     }));
     res.json({ success: true, movies: mappedMovies });
   } catch (err: any) {
@@ -913,6 +1505,7 @@ app.post("/api/scrape", async (req, res) => {
                 release_year: m.release_year,
                 quality: m.quality,
                 poster_url: m.poster_url,
+                detail_url: m.detail_url,
                 links: links,
                 page_num: m.page_num,
                 scraped_at: new Date().toISOString(),
@@ -921,7 +1514,7 @@ app.post("/api/scrape", async (req, res) => {
               totalScraped++;
             } else {
               // Check if new links/episodes have been added
-              const links = await scrapeMovieDetail(m.detail_url);
+              const links = await scrapeMovieDetail(m.detail_url, "pixeldrain");
               const existingLinksStr = JSON.stringify(existing.links || []);
               const newLinksStr = JSON.stringify(links);
               if (newLinksStr !== existingLinksStr) {
@@ -950,7 +1543,7 @@ app.post("/api/scrape", async (req, res) => {
     const allMovies = await moviesCol.find({}).sort({ id: 1 }).toArray();
     const mappedMovies = allMovies.map((m: any) => ({
       ...m,
-      links: typeof m.links === "string" ? m.links : JSON.stringify(m.links),
+      links: deduplicateMovieLinks(m.links),
     }));
 
     res.json({

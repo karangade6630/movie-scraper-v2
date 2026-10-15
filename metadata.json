@@ -1,6 +1,6 @@
 {
   "name": "Movies4U Scraper & Library",
-  "description": "Scrape movies from movies4u.clinic with pagination ranges and SQLite storage",
+  "description": "Scrape movies and TV series with direct download server links and MongoDB storage",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
