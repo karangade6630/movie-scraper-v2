@@ -12,6 +12,21 @@ import {
 } from "./src/db.ts";
 import * as cheerio from "cheerio";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import {
+  isDetailUrl,
+  rebaseToSite,
+  parseListingPage,
+  pickBestMatch,
+  findM4uLinks,
+  findFileLinks,
+  findExternalDownloadCandidates,
+  findRedirect,
+  isChallengePage,
+  sampleExternalLinks,
+  qualityFromContext,
+  resolveUrl,
+  type FoundLink,
+} from "./src/scrapeUtils.ts";
 
 const app = express();
 app.use(express.json());
@@ -80,6 +95,11 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
 
     if (processingTitles.has(normalizedTitle) || processingTitles.has(cleanedTitle)) continue;
 
+    if (!isDetailUrl(m.detail_url, BASE_URL)) {
+      console.warn(`[scrape] Skipping "${normalizedTitle}": no valid detail URL (got "${m.detail_url}")`);
+      continue;
+    }
+
     // Check if the movie already exists in MongoDB by detail_url, title, or cleaned_title
     const moviesCol = getMoviesCollection();
     const exists = await moviesCol.findOne({
@@ -126,7 +146,12 @@ async function processMovies(scraped: any[], isMonitoring: boolean = false) {
         const existingLinksStr = JSON.stringify(exists.links || []);
         const newLinksStr = JSON.stringify(links);
 
-        if (newLinksStr !== existingLinksStr) {
+        // repair a previously stored bad detail_url (e.g. the homepage)
+        if (!isDetailUrl(exists.detail_url, BASE_URL)) {
+          await moviesCol.updateOne({ _id: exists._id }, { $set: { detail_url: m.detail_url } });
+        }
+
+        if (links.length > 0 && newLinksStr !== existingLinksStr) {
           if (!isMonitoring) {
             scrapingStatus.fullScrape = {
               message: `Updating New Episodes/Links for Page ${pageNum}: ${normalizedTitle}`,
@@ -393,6 +418,45 @@ async function resolveHubCloudDirectLinks(
   }
 }
 
+async function fetchPage(url: string, referer?: string): Promise<{ html: string; finalUrl: string }> {
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        ...(referer ? { Referer: referer } : {}),
+      },
+    },
+    2,
+    false,
+  );
+  return { html: await res.text(), finalUrl: res.url || url };
+}
+
+// Load a link-locker page and return the file-host links on it, following meta/JS redirects (max 2 hops).
+async function loadIntermediate(
+  url: string,
+  referer: string,
+): Promise<{ files: FoundLink[]; pageTitle: string }> {
+  let current = url;
+  let from = referer;
+  let pageTitle = "";
+  for (let hop = 0; hop <= 2; hop++) {
+    const { html, finalUrl } = await fetchPage(current, from);
+    const $ = cheerio.load(html);
+    if (hop === 0) pageTitle = $("title").text().trim();
+    if (isChallengePage(html)) console.warn(`[scrape] ${current} returned an anti-bot challenge page`);
+    const files = findFileLinks($, html, finalUrl);
+    if (files.length > 0) return { files, pageTitle };
+    const next = findRedirect(html, finalUrl);
+    if (!next || next === current) break;
+    from = finalUrl;
+    current = next;
+  }
+  return { files: [], pageTitle };
+}
+
 async function scrapeMovieDetail(detailUrl: string, preferredServer: string = "pixeldrain") {
   const qualityGroups: Map<string, { text: string; url: string; alternatives?: { text: string; url: string }[] }[]> = new Map();
 
@@ -472,182 +536,171 @@ async function scrapeMovieDetail(detailUrl: string, preferredServer: string = "p
   }
 
   try {
-    const response = await fetchWithRetry(detailUrl, {}, 2, false);
-    const html = await response.text();
+    // Never scrape the homepage / a listing / a foreign URL as if it were a movie page.
+    if (!isDetailUrl(detailUrl, BASE_URL)) {
+      throw new Error(
+        `"${detailUrl}" is not a movie detail page (homepage, listing or foreign URL) - refusing to scrape it`,
+      );
+    }
+
+    const { html, finalUrl } = await fetchPage(detailUrl);
+    console.log(`[DEBUG] Scraped detail page: ${detailUrl}, HTML length: ${html.length}`);
+    if (isChallengePage(html)) {
+      console.warn(`[scrape] ${detailUrl} returned an anti-bot challenge page - links cannot be read from it`);
+    }
     const $main = cheerio.load(html);
 
-    // Find all unique m4ulinks (matching any m4ulinks.* domain)
-    const m4uEntries: { url: string; contextHeader: string }[] = [];
-    $main("a").each((_, el) => {
-      const href = $main(el).attr("href") || "";
-      if (/m4ulinks/i.test(href)) {
-        if (!m4uEntries.some((e) => e.url === href)) {
-          let header =
-            $main(el).prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim() ||
-            $main(el).parent().prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim() ||
-            $main(el).parent().parent().prevAll("h1, h2, h3, h4, h5, p, span, strong").first().text().trim();
-          m4uEntries.push({ url: href, contextHeader: header });
+    // 1) the link-locker (m4ulinks.<any tld>) links
+    const m4uFound = findM4uLinks($main, html, finalUrl);
+    console.log(`[DEBUG] Total unique m4ulinks found: ${m4uFound.length}`);
+
+    // 2) file-host links placed directly on the movie page
+    const directFiles = m4uFound.length === 0 ? findFileLinks($main, html, finalUrl) : [];
+
+    // 3) the locker changed name? fall back to external "Download ..." links in the post content
+    let intermediates: { url: string; contextHeader: string; label: string }[] = m4uFound.map((f) => ({
+      url: f.url,
+      contextHeader: f.header || f.text,
+      label: "M4ULinks",
+    }));
+    if (m4uFound.length === 0 && directFiles.length === 0) {
+      const generic = findExternalDownloadCandidates($main, finalUrl);
+      console.log(`[DEBUG] No m4ulinks or direct file links; generic external download candidates: ${generic.length}`);
+      if (generic.length === 0) {
+        console.log("[DEBUG] Sample links on page:", sampleExternalLinks($main, finalUrl));
+      }
+      intermediates = generic.map((f) => ({
+        url: f.url,
+        contextHeader: f.header || f.text,
+        label: new URL(f.url).hostname.replace(/^www\./, ""),
+      }));
+    }
+
+    interface SectionItem {
+      headerText: string;
+      pixeldrainUrl?: string;
+      hubCloudUrl?: string;
+      gdFlixUrl?: string;
+      otherUrl?: { url: string; host: string };
+      isZipBatch: boolean;
+    }
+
+    // Turn a flat list of file-host links into quality groups (shared by every discovery path)
+    const processFiles = async (files: FoundLink[], ctxHeader: string, pageTitle: string) => {
+      const sections: SectionItem[] = [];
+
+      for (const f of files) {
+        const href = f.url;
+        let header = f.header.replace(/\s+/g, " ").trim();
+        if (!header) header = ctxHeader || pageTitle || "Download";
+
+        let sec = sections.find((s) => s.headerText === header);
+        if (!sec) {
+          sec = { headerText: header, isZipBatch: f.isZip };
+          sections.push(sec);
+        }
+        if (/pixeldrain/i.test(href)) sec.pixeldrainUrl = href;
+        else if (/hubcloud/i.test(href)) sec.hubCloudUrl = href;
+        else if (/gdflix/i.test(href)) sec.gdFlixUrl = href;
+        else if (!sec.otherUrl) sec.otherUrl = { url: href, host: new URL(href).hostname.replace(/^www\./, "") };
+      }
+
+      for (const sec of sections) {
+        const quality = qualityFromContext(`${ctxHeader} ${pageTitle} ${sec.headerText}`);
+
+        let labelPrefix = "";
+        const epMatch = sec.headerText.match(/episode[s\s:]*(\d+)/i) || sec.headerText.match(/ep[s\s:]*(\d+)/i);
+        if (epMatch) {
+          labelPrefix = `Ep ${epMatch[1].padStart(2, "0")}`;
+        } else if (sec.isZipBatch || /batch|zip/i.test(sec.headerText)) {
+          labelPrefix = "Batch Zip";
+        }
+
+        // Gather all available alternatives for this section
+        const secAlts: { text: string; url: string }[] = [];
+        if (sec.pixeldrainUrl) {
+          secAlts.push({
+            text: labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain",
+            url: sec.pixeldrainUrl.replace("/u/", "/api/file/"),
+          });
+        }
+        if (sec.gdFlixUrl) {
+          secAlts.push({
+            text: labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix",
+            url: sec.gdFlixUrl,
+          });
+        }
+
+        let resolvedSuccess = false;
+
+        if (pref.includes("gdflix") && sec.gdFlixUrl) {
+          resolvedSuccess = true;
+          addLink(quality, labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix", sec.gdFlixUrl, secAlts);
+        } else if (pref.includes("pixel") && sec.pixeldrainUrl) {
+          resolvedSuccess = true;
+          const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
+          addLink(quality, labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain", cleanPxl, secAlts);
+        } else if (sec.hubCloudUrl) {
+          // HubCloud resolution (picks best server matching preferredServer)
+          const directLinks = await resolveHubCloudDirectLinks(sec.hubCloudUrl, preferredServer);
+          if (directLinks.length > 0) {
+            resolvedSuccess = true;
+            const dl = directLinks[0];
+            const finalLabel = labelPrefix ? `${labelPrefix} (${dl.text})` : dl.text;
+            const combinedAlts = [
+              ...secAlts,
+              ...(dl.alternatives || []).map((a) => ({
+                text: labelPrefix ? `${labelPrefix} (${a.text})` : a.text,
+                url: a.url,
+              })),
+            ].filter((a, idx, arr) => arr.findIndex((x) => x.url === a.url) === idx);
+            addLink(quality, finalLabel, dl.url, combinedAlts);
+          }
+        } else if (sec.pixeldrainUrl) {
+          resolvedSuccess = true;
+          const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
+          addLink(quality, labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain", cleanPxl, secAlts);
+        }
+
+        // Fallback: GDFlix only if primary not resolved
+        if (!resolvedSuccess && sec.gdFlixUrl) {
+          resolvedSuccess = true;
+          addLink(quality, labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix", sec.gdFlixUrl, secAlts);
+        }
+        // Any other supported host (hubdrive, filepress, gofile, ...)
+        if (!resolvedSuccess && sec.otherUrl) {
+          const t = labelPrefix ? `${labelPrefix} (${sec.otherUrl.host})` : sec.otherUrl.host;
+          addLink(quality, t, sec.otherUrl.url, [{ text: t, url: sec.otherUrl.url }]);
         }
       }
-    });
+    };
 
-    if (m4uEntries.length > 0) {
-      for (const entry of m4uEntries) {
+    if (intermediates.length > 0) {
+      for (const entry of intermediates) {
         try {
-          console.log(`Scraping m4ulinks page: ${entry.url}`);
-          const m4uRes = await fetchWithRetry(entry.url, {}, 2, false);
-          const m4uHtml = await m4uRes.text();
-          const $m4u = cheerio.load(m4uHtml);
-          const pageTitle = $m4u("title").text().trim();
-
-          const downloadLinks = $m4u("a").filter((_, el) => {
-            const h = $m4u(el).attr("href") || "";
-            return /hubcloud|gdflix|pixeldrain/i.test(h);
-          }).toArray();
-
-          interface SectionItem {
-            headerText: string;
-            pixeldrainUrl?: string;
-            hubCloudUrl?: string;
-            gdFlixUrl?: string;
-            isZipBatch: boolean;
-          }
-          const sections: SectionItem[] = [];
-
-          downloadLinks.forEach((el) => {
-            const $a = $m4u(el);
-            const href = $a.attr("href") || "";
-            const text = $a.text().trim();
-            const isZip = $a.hasClass("btn-zip") || /zip|batch/i.test(text) || /zip|batch/i.test(href);
-
-            let header =
-              $a.prevAll("h1, h2, h3, h4, h5, p, strong, div.badge, div.alert").first().text().trim() ||
-              $a.parent().prevAll("h1, h2, h3, h4, h5, p, strong, div.badge, div.alert").first().text().trim() ||
-              $a.parent().parent().prevAll("h1, h2, h3, h4, h5, p, strong").first().text().trim();
-            header = header.replace(/\s+/g, " ").trim();
-
-            if (!header) {
-              header = entry.contextHeader || pageTitle || "Download";
-            }
-
-            let sec = sections.find((s) => s.headerText === header);
-            if (!sec) {
-              sec = { headerText: header, isZipBatch: isZip };
-              sections.push(sec);
-            }
-            if (/pixeldrain/i.test(href)) {
-              sec.pixeldrainUrl = href;
-            } else if (/hubcloud/i.test(href)) {
-              sec.hubCloudUrl = href;
-            } else if (/gdflix/i.test(href)) {
-              sec.gdFlixUrl = href;
-            }
-          });
-
-          // Single-server resolution with server priority (Pixeldrain default):
-          for (const sec of sections) {
-            let quality = "General";
-            const combinedContext = `${entry.contextHeader} ${pageTitle} ${sec.headerText}`;
-            if (/2160p|4k/i.test(combinedContext)) quality = "4K / 2160P";
-            else if (/1080p/i.test(combinedContext)) quality = "1080P";
-            else if (/720p/i.test(combinedContext)) quality = "720P";
-            else if (/480p/i.test(combinedContext)) quality = "480P";
-
-            let labelPrefix = "";
-            const epMatch = sec.headerText.match(/episode[s\s:]*(\d+)/i) || sec.headerText.match(/ep[s\s:]*(\d+)/i);
-            if (epMatch) {
-              labelPrefix = `Ep ${epMatch[1].padStart(2, "0")}`;
-            } else if (sec.isZipBatch || /batch|zip/i.test(sec.headerText)) {
-              labelPrefix = "Batch Zip";
-            }
-
-            // Gather all available alternatives for this section
-            const secAlts: { text: string; url: string }[] = [];
-            if (sec.pixeldrainUrl) {
-              secAlts.push({
-                text: labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain",
-                url: sec.pixeldrainUrl.replace("/u/", "/api/file/"),
-              });
-            }
-            if (sec.gdFlixUrl) {
-              secAlts.push({
-                text: labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix",
-                url: sec.gdFlixUrl,
-              });
-            }
-
-            let resolvedSuccess = false;
-
-            // If user prefers GDFlix and it is available
-            if (pref.includes("gdflix") && sec.gdFlixUrl) {
-              resolvedSuccess = true;
-              const finalLabel = labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix";
-              addLink(quality, finalLabel, sec.gdFlixUrl, secAlts);
-            } else if (pref.includes("pixel") && sec.pixeldrainUrl) {
-              // Direct Pixeldrain
-              resolvedSuccess = true;
-              const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
-              const finalLabel = labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain";
-              addLink(quality, finalLabel, cleanPxl, secAlts);
-            } else if (sec.hubCloudUrl) {
-              // HubCloud resolution (picks best server matching preferredServer)
-              const directLinks = await resolveHubCloudDirectLinks(sec.hubCloudUrl, preferredServer);
-              if (directLinks.length > 0) {
-                resolvedSuccess = true;
-                const dl = directLinks[0];
-                const finalLabel = labelPrefix ? `${labelPrefix} (${dl.text})` : dl.text;
-                const combinedAlts = [
-                  ...secAlts,
-                  ...(dl.alternatives || []).map((a) => ({
-                    text: labelPrefix ? `${labelPrefix} (${a.text})` : a.text,
-                    url: a.url,
-                  })),
-                ].filter((a, idx, arr) => arr.findIndex((x) => x.url === a.url) === idx);
-
-                addLink(quality, finalLabel, dl.url, combinedAlts);
-              }
-            } else if (sec.pixeldrainUrl) {
-              resolvedSuccess = true;
-              const cleanPxl = sec.pixeldrainUrl.replace("/u/", "/api/file/");
-              const finalLabel = labelPrefix ? `${labelPrefix} (Pixeldrain)` : "Pixeldrain";
-              addLink(quality, finalLabel, cleanPxl, secAlts);
-            }
-
-            // Fallback: GDFlix only if primary not resolved
-            if (!resolvedSuccess && sec.gdFlixUrl) {
-              const finalLabel = labelPrefix ? `${labelPrefix} (GDFlix)` : "GDFlix";
-              addLink(quality, finalLabel, sec.gdFlixUrl, secAlts);
-            }
+          console.log(`Scraping ${entry.label} page: ${entry.url}`);
+          const { files, pageTitle } = await loadIntermediate(entry.url, finalUrl);
+          if (files.length > 0) {
+            await processFiles(files, entry.contextHeader, pageTitle);
+          } else {
+            // Could not read the locker page (JS-only / blocked): keep the locker URL itself so the
+            // user still gets a working link instead of "not found".
+            console.warn(`[scrape] No file-host links readable on ${entry.url}; keeping the link itself`);
+            const quality = qualityFromContext(`${entry.contextHeader} ${pageTitle}`);
+            addLink(quality, entry.label, entry.url, [{ text: entry.label, url: entry.url }]);
           }
         } catch (e) {
-          console.error(`Error scraping m4ulinks page ${entry.url}:`, e);
+          console.error(`Error scraping ${entry.label} page ${entry.url}:`, e);
         }
       }
+    } else if (directFiles.length > 0) {
+      await processFiles(directFiles, "", $main("title").text().trim());
     } else {
-      console.log(`No m4ulinks found on ${detailUrl}, checking direct links...`);
-      const hubLinks = $main("a").filter((_, el) => {
-        const url = $main(el).attr("href") || "";
-        return /hubcloud|pixeldrain|drive/i.test(url);
-      }).toArray();
-
-      for (const el of hubLinks) {
-        const href = $main(el).attr("href") || "";
-        const text = $main(el).text().trim() || "Download";
-        if (/pixeldrain/i.test(href)) {
-          addLink("General", "Pixeldrain", href.replace("/u/", "/api/file/"), [{ text: "Pixeldrain", url: href.replace("/u/", "/api/file/") }]);
-        } else if (/hubcloud/i.test(href)) {
-          const directLinks = await resolveHubCloudDirectLinks(href, preferredServer);
-          if (directLinks.length > 0) {
-            const dl = directLinks[0];
-            addLink("General", dl.text, dl.url, dl.alternatives || [{ text: dl.text, url: dl.url }]);
-          }
-        } else {
-          addLink("General", text, href, [{ text, url: href }]);
-        }
-      }
+      console.log(`No download links found on ${detailUrl}`);
     }
   } catch (err) {
     console.error(`Error scraping detail: ${detailUrl}`, err);
+    throw err;
   }
 
   const links: { quality: string; links: { text: string; url: string; alternatives?: { text: string; url: string }[] }[] }[] = [];
@@ -795,142 +848,11 @@ async function scrapePage(pageNum: number) {
   }
 
   const html = await response.text();
-  const $ = cheerio.load(html);
-  const movies: Array<{
-    title: string;
-    release_year: string;
-    quality: string;
-    poster_url: string;
-    detail_url: string;
-    page_num: number;
-  }> = [];
-
-  // Common selectors for WordPress movie themes (item, article, post, etc.)
-  // Let's check common elements on movies4u.clinic or similar sites:
-  // Usually <article>, .item, .movies, .box, .poster, etc.
-  const selectors = "article, .item, .movies-item, .post, .box, .search-item";
-
-  $(selectors).each((_, el) => {
-    const $el = $(el);
-
-    // Title
-    let title = $el
-      .find("h2, h3, .title, a.title, .movie-title, h1")
-      .first()
-      .text()
-      .trim();
-    if (!title) {
-      title = $el.find("img").attr("alt") || $el.find("a").attr("title") || "";
-    }
-    title = title.replace(/\s+/g, " ").trim();
-    if (!title || title.length < 2) return;
-
-    // Link (Video Source URL or Detail URL)
-    let videoUrl = $el.find("a").attr("href") || "";
-    if (videoUrl && !videoUrl.startsWith("http")) {
-      videoUrl = `${BASE_URL.replace(/\/$/, "")}${videoUrl.startsWith("/") ? "" : "/"}${videoUrl}`;
-    }
-
-    // Poster Image
-    let posterUrl =
-      $el.find("img").attr("data-src") || $el.find("img").attr("src") || "";
-    if (posterUrl && posterUrl.startsWith("//")) {
-      posterUrl = `https:${posterUrl}`;
-    } else if (posterUrl && !posterUrl.startsWith("http")) {
-      posterUrl = `${BASE_URL.replace(/\/$/, "")}${posterUrl}`;
-    }
-
-    // Quality (e.g. Web-DL, HDRip, 1080p, 4K, BluRay)
-    let quality = $el
-      .find(".quality, .rip, .badge, .quality-tag, span.quality")
-      .text()
-      .trim();
-    if (!quality) {
-      // Try to detect quality from text
-      const fullText = $el.text();
-      const matchQ = fullText.match(
-        /(WEB-DL|HDRip|BluRay|CAM|HD|4K|1080p|720p)/i,
-      );
-      quality = matchQ ? matchQ[0] : "Web-DL";
-    }
-
-    // Release Year
-    let releaseYear = $el.find(".year, .date").text().trim();
-    if (!releaseYear) {
-      const matchY =
-        title.match(/\b(19\d\d|20\d\d)\b/) ||
-        $el.text().match(/\b(19\d\d|20\d\d)\b/);
-      releaseYear = matchY ? matchY[1] : "2024";
-    } else {
-      const matchY = releaseYear.match(/\b(19\d\d|20\d\d)\b/);
-      releaseYear = matchY ? matchY[1] : "2024";
-    }
-
-    // Clean title from year if present
-    title = title.replace(/\(\d{4}\)/, "").trim();
-
-    if (
-      title &&
-      !movies.some((m) => m.title.toLowerCase() === title.toLowerCase())
-    ) {
-      movies.push({
-        title,
-        release_year: releaseYear,
-        quality: quality.toUpperCase(),
-        poster_url:
-          posterUrl ||
-          "https://images.unsplash.com/photo-1485846234645-a62644f84728?w=500&auto=format&fit=crop&q=60",
-        detail_url: videoUrl || BASE_URL,
-        page_num: pageNum,
-      });
-    }
-  });
-
-  // Fallback if specific selectors didn't match enough items
-  if (movies.length === 0) {
-    $("a").each((_, el) => {
-      const $a = $(el);
-      const href = $a.attr("href") || "";
-      const text = $a.text().trim();
-      const $img = $a.find("img");
-      if (
-        $img.length > 0 &&
-        text.length > 3 &&
-        (href.includes("/movie/") ||
-          href.includes("/watch/") ||
-          href.length > 10)
-      ) {
-        let posterUrl = $img.attr("data-src") || $img.attr("src") || "";
-        if (posterUrl && !posterUrl.startsWith("http"))
-          posterUrl = `${BASE_URL.replace(/\/$/, "")}${posterUrl}`;
-        let title = text.replace(/\s+/g, " ").trim();
-        let videoUrl = href.startsWith("http")
-          ? href
-          : `${BASE_URL.replace(/\/$/, "")}${href}`;
-        const yearMatch = title.match(/\b(19\d\d|20\d\d)\b/) || ["2024"];
-        const cleanTitle = title.replace(/\(\d{4}\)/, "").trim();
-
-        if (
-          cleanTitle &&
-          !movies.some(
-            (m) => m.title.toLowerCase() === cleanTitle.toLowerCase(),
-          )
-        ) {
-          movies.push({
-            title: cleanTitle,
-            release_year: yearMatch[1] || yearMatch[0],
-            quality: "WEB-DL",
-            poster_url:
-              posterUrl ||
-              "https://images.unsplash.com/photo-1485846234645-a62644f84728?w=500&auto=format&fit=crop&q=60",
-            detail_url: videoUrl,
-            page_num: pageNum,
-          });
-        }
-      }
-    });
+  const movies = parseListingPage(html, response.url || url, pageNum);
+  console.log(`[DEBUG] Listing page ${pageNum}: ${movies.length} movies with valid detail URLs`);
+  if (movies.length === 0 && isChallengePage(html)) {
+    console.warn(`[scrape] Listing page ${pageNum} returned an anti-bot challenge page`);
   }
-
   return movies;
 }
 
@@ -1163,49 +1085,53 @@ app.patch("/api/movies/:id/priority", async (req, res) => {
   }
 });
 
-async function resolveMovieDetailUrl(movie: any): Promise<string> {
-  // 1. Try to fix domain if it's the old one
-  if (movie.detail_url && movie.detail_url.includes(".clinic")) {
-    const newUrl = movie.detail_url.replace(".clinic", ".garden");
-    // Quick validation: just return it if it looks like a valid URL
-    if (newUrl.startsWith("http")) return newUrl;
-  }
+// Find a movie's detail page by searching the site (HTML search first, WordPress REST as a fallback).
+async function searchDetailUrl(movie: any): Promise<string> {
+  const base = BASE_URL.replace(/\/$/, "");
+  const cleaned = cleanMovieTitle(movie.title);
+  const queries = Array.from(
+    new Set([cleaned, cleaned.split(" ").filter((w) => w.length > 2).slice(0, 3).join(" ")].filter(Boolean)),
+  );
 
-  // 2. Return if already valid and not needing fix
-  if (movie.detail_url && movie.detail_url.startsWith("http")) {
-    return movie.detail_url;
-  }
-
-  // 3. Auto-search site by movie title
-  try {
-    const cleanWords = cleanMovieTitle(movie.title)
-      .split(" ")
-      .filter((w) => w.length > 2)
-      .slice(0, 3)
-      .join(" ");
-
-    const searchUrl = `${BASE_URL.replace(/\/$/, "")}/?s=${encodeURIComponent(cleanWords)}`;
-    const res = await fetchWithRetry(searchUrl, {}, 2, false);
-    if (res.ok) {
-      const html = await res.text();
-      const $ = cheerio.load(html);
-      let matchedHref = "";
-      $("article, .item, .movies-item, .post, .box, a").each((_, el) => {
-        const href = $(el).attr("href") || $(el).find("a").attr("href") || "";
-        const titleText = $(el).text().toLowerCase();
-        if (href.startsWith("http") && href.length > 25 && !href.includes("?s=") && !href.includes("category")) {
-          if (!matchedHref && titleText.includes(cleanWords.toLowerCase().slice(0, 5))) {
-            matchedHref = href;
-          }
-        }
-      });
-      if (matchedHref) return matchedHref;
+  for (const q of queries) {
+    try {
+      const searchUrl = `${base}/?s=${encodeURIComponent(q)}`;
+      const { html, finalUrl } = await fetchPage(searchUrl);
+      const candidates = parseListingPage(html, finalUrl, 0).map((m) => ({ title: m.title, url: m.detail_url }));
+      const best = pickBestMatch(movie.title, movie.release_year, candidates);
+      if (best) return best.url;
+    } catch (e) {
+      console.error(`[resolve] HTML search for "${q}" failed:`, (e as Error).message);
     }
-  } catch (e) {
-    console.error("Failed to auto-search detail_url:", e);
+    try {
+      const api = `${base}/wp-json/wp/v2/posts?search=${encodeURIComponent(q)}&per_page=10&_fields=link,title`;
+      const { html } = await fetchPage(api);
+      const posts = JSON.parse(html) as { link: string; title: { rendered: string } }[];
+      const candidates = posts
+        .map((p) => ({ title: cheerio.load(`<i>${p.title?.rendered || ""}</i>`)("i").text(), url: resolveUrl(p.link, base) }))
+        .filter((c) => c.url && isDetailUrl(c.url, BASE_URL));
+      const best = pickBestMatch(movie.title, movie.release_year, candidates);
+      if (best) return best.url;
+    } catch {
+      // REST API disabled / blocked - ignore
+    }
   }
+  return "";
+}
 
-  return movie.detail_url || BASE_URL;
+// Return a *valid* detail-page URL for a stored movie, repairing bad ones (homepage, category,
+// old domain) by searching the site by title. Throws if none can be found.
+async function resolveMovieDetailUrl(movie: any): Promise<string> {
+  const stored = movie.detail_url ? rebaseToSite(movie.detail_url, BASE_URL) : "";
+  if (stored && isDetailUrl(stored, BASE_URL)) return stored;
+
+  console.warn(`[resolve] Stored detail_url "${movie.detail_url}" is not a movie page for "${movie.title}" - searching the site`);
+  const found = await searchDetailUrl(movie);
+  if (found) {
+    console.log(`[resolve] "${movie.title}" -> ${found}`);
+    return found;
+  }
+  throw new Error(`Could not find the detail page for "${movie.title}" on ${BASE_URL}`);
 }
 
 // On-demand fetch/refresh links for all qualities of a single movie with server preference
@@ -1222,6 +1148,15 @@ app.post("/api/movies/:id/fetch-links", async (req, res) => {
     const chosenPref = preferredServer || movie.preferred_server || "pixeldrain";
     const targetUrl = await resolveMovieDetailUrl(movie);
     const links = await scrapeMovieDetail(targetUrl, chosenPref);
+
+    if (links.length === 0) {
+      // keep whatever we already had; only repair the detail URL
+      await moviesCol.updateOne({ id: Number(id) }, { $set: { detail_url: targetUrl } });
+      return res.status(404).json({
+        success: false,
+        error: `No download links found on ${targetUrl}${(movie.links || []).length ? " (existing links kept)" : ""}`,
+      });
+    }
 
     await moviesCol.updateOne(
       { id: Number(id) },
@@ -1385,6 +1320,11 @@ app.post("/api/movies/batch-fetch-links", async (req, res) => {
         try {
           const targetUrl = await resolveMovieDetailUrl(movie);
           const links = await scrapeMovieDetail(targetUrl, chosenPref);
+          if (links.length === 0) {
+            await moviesCol.updateOne({ id: Number(id) }, { $set: { detail_url: targetUrl } });
+            console.warn(`[batch] No links found for movie #${id} on ${targetUrl}; existing links kept`);
+            continue;
+          }
           await moviesCol.updateOne(
             { id: Number(id) },
             {
@@ -1485,6 +1425,7 @@ app.post("/api/scrape", async (req, res) => {
         try {
           const scraped = await scrapePage(p);
           for (const m of scraped) {
+           try {
             const normalizedTitle = m.title.replace(/\s+/g, " ").trim();
             const cleanedTitle = cleanMovieTitle(normalizedTitle);
             const existing = await moviesCol.findOne({
@@ -1517,7 +1458,10 @@ app.post("/api/scrape", async (req, res) => {
               const links = await scrapeMovieDetail(m.detail_url, "pixeldrain");
               const existingLinksStr = JSON.stringify(existing.links || []);
               const newLinksStr = JSON.stringify(links);
-              if (newLinksStr !== existingLinksStr) {
+              if (!isDetailUrl(existing.detail_url, BASE_URL)) {
+                await moviesCol.updateOne({ _id: existing._id }, { $set: { detail_url: m.detail_url } });
+              }
+              if (links.length > 0 && newLinksStr !== existingLinksStr) {
                 await moviesCol.updateOne(
                   { _id: existing._id },
                   { 
@@ -1532,6 +1476,10 @@ app.post("/api/scrape", async (req, res) => {
                 totalScraped++;
               }
             }
+           } catch (movieErr: any) {
+            console.error(`Failed to process "${m.title}":`, movieErr.message);
+            errors.push(`${m.title}: ${movieErr.message}`);
+           }
           }
         } catch (err: any) {
           console.error(`Error scraping page ${p}:`, err.message);

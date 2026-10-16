@@ -9,12 +9,15 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:unit": "node --import tsx --test tests/scraper.test.ts",
+    "test:integration": "node tests/integration.mjs",
+    "test": "npm run test:unit && npm run test:integration",
+    "debug:links": "tsx debug_links.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
-
     "@vitejs/plugin-react": "^5.0.4",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
@@ -25,7 +28,6 @@
     "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-
     "vite": "^6.2.3"
   },
   "devDependencies": {

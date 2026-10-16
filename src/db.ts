@@ -8,12 +8,28 @@ const uri = process.env.MONGODB_URI;
 let client: MongoClient | null = null;
 let db: Db | null = null;
 
+// Minimal Mongo-style matcher ($or, $in, equality) so the in-memory fallback behaves like MongoDB
+function matchesQuery(doc: any, query: any): boolean {
+  if (!query || Object.keys(query).length === 0) return true;
+  return Object.entries(query).every(([key, cond]: [string, any]) => {
+    if (key === "$or") return (cond as any[]).some((q) => matchesQuery(doc, q));
+    if (key === "$and") return (cond as any[]).every((q) => matchesQuery(doc, q));
+    const val = doc[key];
+    if (cond && typeof cond === "object" && !Array.isArray(cond)) {
+      if ("$in" in cond) return (cond.$in as any[]).includes(val);
+      if ("$ne" in cond) return val !== cond.$ne;
+      return true;
+    }
+    return val === cond;
+  });
+}
+
 // In-memory fallback collection for environments without MongoDB configured
 class InMemoryCollection {
   private data: any[] = [];
   
-  async find(query: any = {}, options?: any) {
-    let results = [...this.data];
+  find(query: any = {}, options?: any) {
+    let results = this.data.filter((d) => matchesQuery(d, query));
     return {
       sort: () => ({
         skip: () => ({
@@ -31,17 +47,7 @@ class InMemoryCollection {
   }
 
   async findOne(query: any) {
-    if (!query) return this.data[0] || null;
-    if (query.id !== undefined) {
-      return this.data.find(d => d.id === query.id);
-    }
-    if (query.title) {
-      return this.data.find(d => d.title === query.title);
-    }
-    if (query._id) {
-      return this.data.find(d => d._id === query._id);
-    }
-    return this.data[0] || null;
+    return this.data.find((d) => matchesQuery(d, query)) || null;
   }
 
   async insertOne(doc: any) {
